@@ -1480,6 +1480,54 @@ static PyObject* PyMinqlxtended_DropItem(PyObject* self, PyObject* args) {
     return PyLong_FromLong((long)(dropped - g_entities));
 }
 
+// respawn_item
+
+/* Arms the timer a pickup arms: the game's own RespawnItem runs on the item *delay* ms from
+ * now, bringing it back with the respawn event and, for a team of items, picking the member.
+ * It doesn't hide the item. Touch_Item does that by setting EF_NODRAW and SVF_NOCLIENT and
+ * clearing r.contents before relinking, and all of those are writable. */
+static PyObject* PyMinqlxtended_RespawnItem(PyObject* self, PyObject* args) {
+    int entity_id, delay;
+    if (!PyArg_ParseTuple(args, "ii:respawn_item", &entity_id, &delay)) {
+        return NULL;
+    }
+    if (!qlx_vm_ready()) {
+        return NULL;
+    }
+    if (RespawnItem == NULL) {
+        PyErr_SetString(qlx_EngineStateError, "RespawnItem did not resolve in this build.");
+        return NULL;
+    }
+
+    if (entity_id < MAX_CLIENTS || entity_id >= ENTITYNUM_MAX_NORMAL) {
+        PyErr_Format(PyExc_ValueError, "entity_id needs to be a number from %d to %d.",
+                     MAX_CLIENTS, ENTITYNUM_MAX_NORMAL - 1);
+        return NULL;
+    }
+    if (delay < 0 || delay > INT_MAX - level->time) {
+        PyErr_Format(PyExc_ValueError, "delay needs to be a number from 0 to %d.",
+                     INT_MAX - level->time);
+        return NULL;
+    }
+
+    gentity_t* ent = &g_entities[entity_id];
+    if (!ent->inuse || ent->s.eType != ET_ITEM || !ent->item) {
+        PyErr_Format(PyExc_ValueError, "entity %d is not an item.", entity_id);
+        return NULL;
+    }
+    // Touch_Item frees a dropped item rather than arming its respawn, since it was never
+    // part of the map.
+    if (ent->flags & FL_DROPPED_ITEM) {
+        PyErr_Format(PyExc_ValueError, "entity %d is a dropped item, which never respawns.",
+                     entity_id);
+        return NULL;
+    }
+
+    ent->think     = RespawnItem;
+    ent->nextthink = level->time + delay;
+    Py_RETURN_TRUE;
+}
+
 // remove_entity/spawn_entity/link_entity/unlink_entity
 // Map entity surgery: freeing a slot, spawning through the engine's own machinery, and
 // relinking into the area grid. Verified against qagame/qzeroded 1069.
@@ -2476,6 +2524,13 @@ static PyMethodDef minqlxtendedMethods[] = {
      "from the player, returning the new entity's id, or None if nothing spawned.\n\n"
      "The player's inventory is untouched: a drop that should also take the item away "
      "clears the matching GameClient field itself."},
+    {"respawn_item", PyMinqlxtended_RespawnItem, METH_VARARGS,
+     "respawn_item(entity_id, delay) -- respawn a map item delay milliseconds from now, "
+     "through the game's own RespawnItem, the way the timer a pickup arms does.\n\n"
+     "The item isn't hidden meanwhile. To take it off the map until then, set "
+     "EntityEffect.NODRAW in s.e_flags and ServerFlag.NOCLIENT in r.sv_flags, zero "
+     "r.contents and link_entity() it, as Touch_Item does. Dropped items are refused, "
+     "since they never respawn. Game thread only."},
     {"remove_entity", PyMinqlxtended_RemoveEntity, METH_VARARGS,
      "remove_entity(entity_id) -- free a map entity's slot, as G_FreeEntity does.\n\n"
      "Client slots, the world, never_free entities and already-freed slots are refused. "
