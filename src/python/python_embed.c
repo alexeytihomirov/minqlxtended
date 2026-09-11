@@ -74,6 +74,7 @@ PyObject* weapon_fired_handler = NULL;
 // Gated: armed by Python only while something is hooking the event. See pyminqlxtended.h.
 PyObject* damage_handler       = NULL;
 PyObject* cvar_changed_handler = NULL;
+PyObject* item_touch_handler   = NULL;
 
 static int initialized = 0;
 
@@ -135,6 +136,7 @@ static handler_t handlers[] = {
 
     {"damage", &damage_handler},
     {"cvar_changed", &cvar_changed_handler},
+    {"item_touch", &item_touch_handler},
 
     {NULL, NULL}};
 

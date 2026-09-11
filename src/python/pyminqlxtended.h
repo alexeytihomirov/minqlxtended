@@ -117,6 +117,12 @@ extern PyObject* damage_handler;
  */
 extern PyObject* cvar_changed_handler;
 
+/*
+ * Gated too. Touch_Item runs for every touch of an item trigger, most of them rejected, so a
+ * player standing on an item they can't take reaches it again and again.
+ */
+extern PyObject* item_touch_handler;
+
 // Custom console command handler. These are commands added through Python that can be used
 // from the console or using RCON.
 extern PyObject* custom_command_handler;
@@ -209,5 +215,10 @@ void DamageDispatcher(int target_id, int attacker_id, int damage, int dflags, in
  * what the engine kept, so a range-flagged cvar reports its clamped text. Nothing fires for
  * creation, a same-value write, or an unforced write to a CVAR_LATCH cvar. */
 void CvarChangedDispatcher(const char* name, const char* old_value, const char* new_value);
+
+/* A player touching an item's trigger, from the Touch_Item hook, before the game module decides
+ * whether it's a pickup, so most calls aren't. entity_id is the item's own entity. Gated.
+ * Returns 0 when a handler cancelled; the touch then never reaches Touch_Item. */
+int ItemTouchDispatcher(int client_id, int entity_id);
 
 #endif /* PYMINQLXTENDED_H */

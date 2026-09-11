@@ -919,6 +919,31 @@ def handle_item_pickup(client_id, item_name):
         minqlxtended.log_exception()
         return True
 
+def handle_item_touch(client_id, entity_id):
+    """Called from the Touch_Item hook for every touch of an item trigger, pickup or not.
+
+    **Not** registered by :func:`register_handlers`. Like ``damage``, the slot is armed by the
+    dispatcher only while the event has hooks. Returning False keeps the touch from the game.
+
+    :param client_id: The player touching the item.
+    :type client_id: int
+    :param entity_id: The item's entity number.
+    :type entity_id: int
+
+    """
+    try:
+        dispatcher = minqlxtended.EVENT_DISPATCHERS["item_touch"]
+        # As with damage: a dispatch already in flight when the last hook goes away must
+        # not pay for a Player.
+        if not dispatcher._handler_chain:
+            return True
+
+        return dispatcher.dispatch(minqlxtended.Player(client_id),
+                                   minqlxtended.Entity(entity_id))
+    except:
+        minqlxtended.log_exception()
+        return True
+
 def handle_demo_finished(client_id, path, size, discarded, failed):
     """Called once the demo writer has closed a segment.
 
@@ -1047,6 +1072,6 @@ def register_handlers():
     minqlxtended.register_handler("team_switch_attempt", handle_team_switch_attempt)
     minqlxtended.register_handler("userinfo", handle_userinfo)
 
-    # `damage` and `weapon_fired` are missing from this list because they're gated; their
-    # dispatchers arm the slot only while the event has hooks. See
+    # `damage`, `weapon_fired`, `cvar_changed` and `item_touch` are missing from this list
+    # because they're gated; their dispatchers arm the slot only while the event has hooks. See
     # EventDispatcher.gated_handler.
