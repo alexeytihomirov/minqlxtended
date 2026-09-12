@@ -39,6 +39,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "features/demos.h"
 #include "features/reliable.h"
 #include "features/scoreboard.h"
+#include "features/stream.h"
 #include "maps_parser.h"
 
 // For comparison with the dedi's executable name to avoid segfaulting
@@ -482,14 +483,15 @@ void InitializeStatic(void) {
     Cmd_AddCommand("steam_downloadugcdefer", DownloadWorkshopItem);
     Cmd_AddCommand("stopfollowing", StopFollowing);
     Cmd_AddCommand("qlx_prof", ProfileCommand);
+    Cmd_AddCommand("qlx_stream", StreamCommand);
 #ifndef NOPY
-    // These guard hooks that only a Python build installs. qlx_prof stays out of the guard,
-    // since Demo_Capture is hooked either way.
+    // These guard hooks that only a Python build installs. qlx_prof and qlx_stream stay out of
+    // the guard: Demo_Capture and G_RunFrame are both hooked either way.
     Cmd_AddCommand("qlx_reliable", ReliableCommand);
     Cmd_AddCommand("qlx_scoreboard", ScoreboardCommand);
     Cmd_AddCommand("qlx_pyperf", PyPerfCommand);
     Cmd_AddCommand("qlx", PyRcon);
-    Cmd_AddCommand("pycmd", PyCommand);
+    Cmd_AddCommand("pycmd", PyPrefixCommand);
 #endif
 
 #ifndef NOPY
@@ -539,7 +541,8 @@ void InitializeVm(void) {
 void InitializeCvars(void) {
     sv_maxclients = Cvar_FindVar("sv_maxclients");
 
-    Demo_Init(); // Register the sv_demo* cvars now.
+    Demo_Init();   // Register the sv_demo* cvars now.
+    Stream_Init(); // ...and the sv_demoStream* ones.
 #ifndef NOPY
     Reliable_Init();   // Same for qlx_reliable*.
     Scoreboard_Init(); // ...and qlx_scoreboard*.

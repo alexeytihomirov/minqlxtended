@@ -35,6 +35,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "common.h"
 #include "demos.h"
 #include "profile.h"
+#include "stream.h"
 #include "engine/quake_common.h"
 
 extern serverStatic_t *svs; // defined in dllmain.c
@@ -73,7 +74,7 @@ static demo_thread_state_t demo_thread_state = DEMO_THREAD_STOPPED;
 
 static demo_thread_state_t demo_state_cached = DEMO_THREAD_STOPPED;
 static uint8_t demo_active[MAX_DEMO_CLIENTS]; // slot has an open segment.
-static unsigned char demo_scratch[MAX_NETCHAN_MSGLEN + 64];
+static unsigned char capture_scratch[MAX_NETCHAN_MSGLEN + 64];
 
 // Per-slot override of sv_demoRecord set from Python: 0 follows the cvar, 1 always
 // records, -1 never does. Game thread only, same as demo_active.
@@ -623,12 +624,61 @@ void Demo_Init(void) {
     }
 }
 
-// Split out of Demo_Capture so the profiler wrapper covers every early return.
-static void Demo_CaptureBody(msg_t *msg, client_t *client) {
-    if (!sv_demoRecord || !MSG_WriteBits || !svs || !svs->clients || !fs_homepath) {
-        return;
+static int demo_interested(int slot) {
+    if (demo_state_cached != DEMO_THREAD_STOPPED || demo_active[slot] || demo_request[slot] > 0) {
+        return 1;
+    }
+    return sv_demoRecord && sv_demoRecord->integer;
+}
+
+static int demo_want(int slot, int is_gamestate, client_t *client) {
+    if (!sv_demoRecord || !fs_homepath) {
+        return 0;
     }
     if (!demo_reconcile_thread()) {
+        return 0;
+    }
+
+    demo_rec_hdr_t hdr = {0};
+    hdr.slot           = (int32_t)slot;
+
+    if (!demo_slot_wanted(slot)) {
+        // Turned off mid-segment, so finalise now instead of waiting for a disconnect.
+        if (demo_active[slot]) {
+            hdr.type = DEMO_REC_CLOSE;
+            demo_ring_put(&hdr, NULL);
+            demo_active[slot] = 0;
+        }
+        return 0;
+    }
+
+    if (is_gamestate) {
+        // A valid demo begins at a gamestate.
+        if (demo_active[slot]) {
+            hdr.type = DEMO_REC_CLOSE;
+            demo_ring_put(&hdr, NULL); // OPEN should also finalise the writer-side.
+            demo_active[slot] = 0;
+        }
+        char path[512];
+        demo_build_name(path, sizeof(path), slot, client);
+        hdr.type = DEMO_REC_OPEN;
+        hdr.len  = (uint32_t)strlen(path) + 1;
+        hdr.seq  = (int32_t)(demo_gen[slot] + 1); // seq is unused for OPEN.
+        if (demo_ring_put(&hdr, path) != 0) {
+            return 0; // ring full; retry at this client's next gamestate.
+        }
+        demo_gen[slot]++;
+        demo_active[slot] = 1;
+        snprintf(demo_path[slot], sizeof(demo_path[slot]), "%s", path);
+    } else if (!demo_active[slot]) {
+        return 0; // we have not seen this slot's gamestate yet.
+    }
+
+    return 1;
+}
+
+static void Demo_CaptureBody(msg_t *msg, client_t *client) {
+    if (!MSG_WriteBits || !svs || !svs->clients) {
         return;
     }
     if (msg->cursize <= 0 || msg->cursize > MAX_NETCHAN_MSGLEN) {
@@ -640,60 +690,43 @@ static void Demo_CaptureBody(msg_t *msg, client_t *client) {
         return;
     }
 
-    int seq          = client->netchan.outgoingSequence;
-    int is_gamestate = (seq == client->gamestateMessageNum);
-
-    demo_rec_hdr_t hdr = {0};
-    hdr.slot           = (int32_t)slot;
-
-    if (!demo_slot_wanted((int)slot)) {
-        // Turned off mid-segment, so finalise now instead of waiting for a disconnect.
-        if (demo_active[slot]) {
-            hdr.type = DEMO_REC_CLOSE;
-            demo_ring_put(&hdr, NULL);
-            demo_active[slot] = 0;
-        }
+    int disk_maybe   = demo_interested((int)slot);
+    int stream_maybe = Stream_Interested((int)slot);
+    if (!disk_maybe && !stream_maybe) {
         return;
     }
 
-    if (is_gamestate) {
-        // A valid demo begins at a gamestate.
-        if (demo_active[slot]) {
-            hdr.type = DEMO_REC_CLOSE;
-            demo_ring_put(&hdr, NULL); // OPEN should also finalise the writer-side.
-            demo_active[slot] = 0;
-        }
-        char path[512];
-        demo_build_name(path, sizeof(path), (int)slot, client);
-        hdr.type = DEMO_REC_OPEN;
-        hdr.len  = (uint32_t)strlen(path) + 1;
-        hdr.seq  = (int32_t)(demo_gen[slot] + 1); // seq is unused for OPEN.
-        if (demo_ring_put(&hdr, path) != 0) {
-            return; // ring full; retry at this client's next gamestate.
-        }
-        demo_gen[slot]++;
-        demo_active[slot] = 1;
-        snprintf(demo_path[slot], sizeof(demo_path[slot]), "%s", path);
-    } else if (!demo_active[slot]) {
-        return; // we have not seen this slot's gamestate yet.
+    int seq          = client->netchan.outgoingSequence;
+    int is_gamestate = (seq == client->gamestateMessageNum);
+
+    int to_disk   = disk_maybe && demo_want((int)slot, is_gamestate, client);
+    int to_stream = stream_maybe && Stream_Want((int)slot, is_gamestate, client);
+    if (!to_disk && !to_stream) {
+        return;
     }
 
     // Use a scratch buffer, never mutate the live outgoing message.
     msg_t tmp   = *msg;
-    tmp.data    = demo_scratch;
-    tmp.maxsize = (int)sizeof(demo_scratch);
-    memcpy(demo_scratch, msg->data, (size_t)msg->cursize);
+    tmp.data    = capture_scratch;
+    tmp.maxsize = (int)sizeof(capture_scratch);
+    memcpy(capture_scratch, msg->data, (size_t)msg->cursize);
     MSG_WriteBits(&tmp, SVC_EOF, 8); // bit-accurate append.
 
-    hdr.type = DEMO_REC_BLOCK;
-    hdr.seq  = (int32_t)seq;
-    hdr.len  = (uint32_t)tmp.cursize;
-    if (demo_ring_put(&hdr, demo_scratch) != 0) {
-        DebugPrint("demo: ring full, dropping slot %ld segment\n", slot);
-        demo_active[slot] = 0;
-        hdr.type          = DEMO_REC_CLOSE;
-        hdr.len           = 0;
-        demo_ring_put(&hdr, NULL);
+    if (to_disk) {
+        demo_rec_hdr_t hdr = {DEMO_REC_BLOCK, (int32_t)slot, (int32_t)seq, (uint32_t)tmp.cursize};
+        if (demo_ring_put(&hdr, capture_scratch) != 0) {
+            DebugPrint("demo: ring full, dropping slot %ld segment\n", slot);
+            demo_active[slot] = 0;
+            hdr.type          = DEMO_REC_CLOSE;
+            hdr.len           = 0;
+            demo_ring_put(&hdr, NULL);
+        }
+    }
+
+    if (to_stream) {
+        PROF_BEGIN(t_stream);
+        Stream_Block((int)slot, seq, is_gamestate, client, capture_scratch, (uint32_t)tmp.cursize);
+        PROF_END(PROF_STREAM_CAPTURE, t_stream);
     }
 }
 

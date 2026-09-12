@@ -17,14 +17,15 @@
 # along with minqlxtended. If not, see <http://www.gnu.org/licenses/>.
 
 """What is installed on this server: the maps, their .arena declarations, their BSP
-entities, and the factories. Read from the pk3 files themselves, off the same search
-paths the engine mounts.
+entities, and the factories. Read from the pk3 files per the engine search paths.
 
-Three search locations, in ascending precedence:
+Search locations, in ascending precedence:
+    <workshop root>/<id>/         Steam Workshop items, one directory per item id
     <fs_basepath>/baseq3          the base game data
-    <qlx_workshopPath>/<id>/      Steam Workshop items (derived from fs_basepath as
-                                  ../../workshop/content/282440 when the cvar is empty)
     <fs_homepath>/baseq3          the server admin's own overrides
+
+The workshop root is derived from ``fs_basepath`` and ``fs_homepath``. Set
+``qlx_workshopPath`` to name it outright where that derivation does not suit a box.
 
 Within one directory pk3s apply in case-insensitive filename order, then that directory's
 loose .arena and .factories files (in it or in its scripts/ subdirectory). Within one
@@ -47,6 +48,7 @@ import minqlxtended
 import collections
 import json
 import os
+import re
 import struct
 import threading
 import time
@@ -66,6 +68,13 @@ __all__ = (
 _MAX_ENTITY_LUMP = 16 * 1024 * 1024
 _STAT_TTL = 30.0
 _ENTITY_CACHE_SIZE = 8
+_WORKSHOP_APPID = "282440"
+_IMAGE_EXTENSIONS = ("jpg", "jpeg", "tga", "png")
+_WORKSHOP_FILE_DEFAULT = "workshop.txt"
+_WORKSHOP_MAX_ITEMS = 256
+_WORKSHOP_ID_RE = re.compile(r"\s*\+?(\d+)")
+
+_workshop_reported: tuple | None = None
 
 class MapSource(typing.NamedTuple):
     """One pk3 that carries a map. A map can have several; precedence decides which wins."""
@@ -77,6 +86,8 @@ class MapSource(typing.NamedTuple):
     has_aas: bool
     #: Whether the pk3 carries a levelshot for the map.
     has_levelshot: bool
+    #: Whether the pk3 carries the map's levelshots/preview/ thumbnail.
+    has_preview: bool = False
 
 
 class ArenaInfo(typing.NamedTuple):
@@ -391,24 +402,232 @@ class _ProviderRecord(typing.NamedTuple):
 
     mtime_ns: int
     size: int
-    maps: dict[str, tuple[bool, bool]]  # name -> (has_aas, has_levelshot)
+    maps: dict[str, tuple[bool, bool, bool]]  # name -> (has_aas, has_levelshot, has_preview)
     arenas: dict[str, ArenaInfo]
     factories: dict[str, FactoryInfo]
 
 
-_EMPTY_MAPS: dict[str, tuple[bool, bool]] = {}
+_EMPTY_MAPS: dict[str, tuple[bool, bool, bool]] = {}
 
 
-def _workshop_root() -> str | None:
+def _workshop_candidates() -> list[str]:
+    """Every plausible Steam Workshop content root, in probe order, existing or not.
+
+    ``qlx_workshopPath`` is taken on its own. Setting it says the derivation is wrong for
+    that box, so probing on anyway could hand back the tree the operator pointed away from.
+
+    Otherwise two layouts, since steamcmd produces both. ``+force_install_dir <DIR>`` puts
+    the items under the server's own install; a plain Steam library puts the server in
+    ``steamapps/common/<name>`` and the items two levels up and across.
+    """
     override = minqlxtended.get_cvar("qlx_workshopPath")
     if override:
-        return override
-    basepath = minqlxtended.get_cvar("fs_basepath")
-    if not basepath:
-        return None
-    # steamcmd puts the server in steamapps/common/<name> and workshop items in
-    # steamapps/workshop/content/<appid>, so two levels up and across.
-    return os.path.normpath(os.path.join(basepath, "..", "..", "workshop", "content", "282440"))
+        return [os.path.normpath(override)]
+
+    out = []
+    for base in (minqlxtended.get_cvar("fs_basepath"), minqlxtended.get_cvar("fs_homepath")):
+        if not base:
+            continue
+        out.append(os.path.normpath(
+            os.path.join(base, "steamapps", "workshop", "content", _WORKSHOP_APPID)))
+        out.append(os.path.normpath(
+            os.path.join(base, "..", "..", "workshop", "content", _WORKSHOP_APPID)))
+    return list(dict.fromkeys(out))
+
+
+def _workshop_roots() -> tuple[str, ...]:
+    """The candidates that exist, deduplicated by realpath.
+
+    Every one of them: taking only the first would let probe order decide which maps this
+    server sees, and a created-but-empty ``steamapps/workshop/content`` would then hide the
+    rest. A map carried by two roots just gains a second source. The returned path is the
+    unresolved one, so a log line matches what the operator typed.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for candidate in _workshop_candidates():
+        try:
+            if not os.path.isdir(candidate):
+                continue
+            key = os.path.realpath(candidate)
+        except OSError:  # a broken symlink or an unreadable parent
+            continue
+        if key not in seen:
+            seen.add(key)
+            out.append(candidate)
+    return tuple(out)
+
+
+class _WorkshopScan(typing.NamedTuple):
+    """What resolving the workshop list found, so the report can tell the failures apart."""
+
+    #: fs_skipWorkshop is set, so the engine mounts nothing and we follow it.
+    skipped: bool
+    #: The sv_workshopFile that was read, or None if none of them existed.
+    file_path: str | None
+    #: Where it was looked for, in order.
+    file_tried: tuple[str, ...]
+    #: The content roots that exist.
+    roots: tuple[str, ...]
+    #: How many item ids the file named.
+    listed: int
+    #: Ids with no directory under any root: configured, never installed.
+    missing: tuple[int, ...]
+
+
+def _workshop_skipped() -> bool:
+    """Whether the engine has workshop content switched off altogether.
+
+    fs_skipWorkshop makes idSteamServer_AddWorkshopFiles @0x44e690 return having mounted
+    nothing, so the search path holds no workshop item at all. Registered CVAR_INIT, so it is
+    whatever the command line said and cannot change while the server runs.
+    """
+    value = minqlxtended.get_cvar("fs_skipWorkshop")
+    if not value:
+        return False
+    try:
+        return int(value) != 0
+    except ValueError:  # the engine reads it with Cvar_VariableIntegerValue, which is 0 here
+        return False
+
+
+def _workshop_file() -> tuple[str | None, tuple[str, ...]]:
+    """The sv_workshopFile that exists, and everywhere that was tried.
+
+    The engine opens it with FS_FOpenFileByMode, so it comes off the search path. On a
+    dedicated server that means the mounted baseq3 directories, homepath first:
+    FS_AddGameDirectory prepends and homepath is mounted last, so homepath wins.
+    """
+    name = minqlxtended.get_cvar("sv_workshopFile") or _WORKSHOP_FILE_DEFAULT
+    tried: list[str] = []
+    found: str | None = None
+    for base in (minqlxtended.get_cvar("fs_homepath"), minqlxtended.get_cvar("fs_basepath")):
+        if not base:
+            continue
+        path = os.path.normpath(os.path.join(base, "baseq3", name))
+        if path in tried:
+            continue
+        tried.append(path)
+        if found is None and os.path.isfile(path):
+            found = path
+    return found, tuple(tried)
+
+
+def _workshop_file_ids(path: str) -> tuple[int, ...]:
+    """The item ids *path* lists, in order and deduplicated.
+
+    Follows idSteamServer_SV_StartupWorkshop @0x44eac0: the text is split on newlines, a line
+    starting with '#' is a comment, and every other line goes through sscanf("%llu"). That
+    skips leading whitespace, takes the digits and ignores the rest, so "123 # bloodrun" is
+    123 and a CRLF ending is harmless. A line not starting with a number is the engine's
+    "Parse fail, skip line".
+
+    One divergence: %llu accepts a leading '-' and wraps it into a huge unsigned, and we
+    refuse it. That only ever skips a directory lookup which could not have matched.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as e:
+        _logger().warning("Could not read the workshop items file %s: %s", path, e)
+        return ()
+
+    ids: dict[int, None] = {}  # a dict keeps the file's order
+    for line in text.split("\n"):
+        if line.startswith("#"):
+            continue
+        match = _WORKSHOP_ID_RE.match(line)
+        if match:
+            ids[int(match.group(1))] = None
+    return tuple(ids)
+
+
+def _workshop_items() -> tuple[list[tuple[int, str]], _WorkshopScan]:
+    """(id, directory) for every workshop item this server can actually mount.
+
+    Do not go back to enumerating the content directory. Steam keeps everything it has ever
+    downloaded, including items dropped from the configuration long ago, and offering a map
+    the engine will not mount gives you a map vote that fails. sv_workshopFile is the list
+    the engine was told to fetch, so that list intersected with what is on disk is the
+    closest a Python scan gets.
+
+    One blind spot: the engine mounts what Steam reports as subscribed
+    (GetSubscribedItems), which we cannot ask. An item fetched at runtime with
+    steam_downloadugcdefer and never added to the file is mounted after the next FS_Restart
+    and still will not show up here.
+    """
+    if _workshop_skipped():
+        return [], _WorkshopScan(True, None, (), (), 0, ())
+
+    path, tried = _workshop_file()
+    if path is None:
+        return [], _WorkshopScan(False, None, tried, (), 0, ())
+
+    ids = _workshop_file_ids(path)
+    roots = _workshop_roots()
+
+    found: list[tuple[int, str]] = []
+    missing: list[int] = []
+    for item_id in ids:
+        for root in roots:
+            item_dir = os.path.join(root, str(item_id))
+            if os.path.isdir(item_dir):
+                found.append((item_id, item_dir))
+                break
+        else:
+            missing.append(item_id)
+
+    return found, _WorkshopScan(False, path, tried, roots, len(ids), tuple(missing))
+
+
+def _report_workshop(scan: _WorkshopScan, mounted: int, pk3s: int) -> None:
+    """Say once what the workshop scan found, and again when the answer changes.
+
+    Each branch is a different fault with a different fix."""
+    global _workshop_reported
+    report = (scan, mounted, pk3s)
+    if report == _workshop_reported:
+        return
+    _workshop_reported = report
+
+    if scan.skipped:
+        _logger().info("fs_skipWorkshop is set, so the engine mounts no workshop content and "
+                       "no workshop maps are reported.")
+        return
+
+    if scan.file_path is None:
+        _logger().warning(
+            "No workshop items file, so workshop maps will be invisible. Tried %s. The engine "
+            "reads the list named by sv_workshopFile, one item id per line.",
+            ", ".join(scan.file_tried) or "nowhere: fs_basepath and fs_homepath are both unset")
+        return
+
+    if not scan.listed:
+        _logger().warning("%s names no workshop item ids, so no workshop maps are installed.",
+                          scan.file_path)
+        return
+
+    if not scan.roots:
+        _logger().warning(
+            "%s names %d workshop item(s) but no content root exists; tried %s. Set "
+            "qlx_workshopPath to the directory holding the numbered item folders.",
+            scan.file_path, scan.listed, ", ".join(_workshop_candidates()))
+        return
+
+    if mounted:
+        _logger().info("Scanning %d of %d workshop item(s) (%d pk3) from %s.",
+                       mounted, scan.listed, pk3s, ", ".join(scan.roots))
+    if mounted > _WORKSHOP_MAX_ITEMS:
+        _logger().warning(
+            "%d workshop items are installed, but the engine asks Steam for at most %d, so "
+            "some of these maps will not be mounted.", mounted, _WORKSHOP_MAX_ITEMS)
+    if scan.missing:
+        shown = ", ".join(str(item_id) for item_id in scan.missing[:5])
+        more = f" and {len(scan.missing) - 5} more" if len(scan.missing) > 5 else ""
+        _logger().warning(
+            "%d workshop item(s) named by %s are not installed under %s: %s%s. They were "
+            "configured but never downloaded.",
+            len(scan.missing), scan.file_path, ", ".join(scan.roots), shown, more)
 
 
 def _stat_candidate(path: str, kind: str, workshop_id: int | None) -> _Candidate | None:
@@ -461,21 +680,26 @@ def _dir_candidates(directory: str, workshop_id: int | None = None) -> list[_Can
 
 
 def _find_candidates() -> list[_Candidate]:
+    """Every provider, in ascending precedence. The fold in _rebuild lets later ones win.
+
+    Workshop content goes first because it sits at the bottom of the engine's search path.
+    FS_AddGameDirectory @0x42cb70 links each mount at the head of fs_searchpaths, and
+    FS_Startup @0x42cf54 mounts workshop content before any baseq3 directory, so a workshop
+    pk3 loses to stock content.
+    """
     candidates: list[_Candidate] = []
+
+    items, scan = _workshop_items()
+    pk3s = 0
+    for item_id, item_dir in items:
+        found = _dir_candidates(item_dir, item_id)
+        pk3s += sum(1 for c in found if c.kind == "pk3")
+        candidates.extend(found)
+    _report_workshop(scan, len(items), pk3s)
+
     basepath = minqlxtended.get_cvar("fs_basepath")
     if basepath:
         candidates.extend(_dir_candidates(os.path.join(basepath, "baseq3")))
-
-    workshop = _workshop_root()
-    if workshop:
-        try:
-            items = sorted(os.listdir(workshop))
-        except OSError:
-            items = []
-        for item in items:
-            item_dir = os.path.join(workshop, item)
-            if os.path.isdir(item_dir):
-                candidates.extend(_dir_candidates(item_dir, int(item) if item.isdigit() else None))
 
     homepath = minqlxtended.get_cvar("fs_homepath")
     if homepath and homepath != basepath:
@@ -500,7 +724,7 @@ def _info_members(members: dict[str, str], stock: str, suffix: str) -> list[str]
 
 
 def _read_pk3(candidate: _Candidate) -> _ProviderRecord:
-    maps: dict[str, tuple[bool, bool]] = {}
+    maps: dict[str, tuple[bool, bool, bool]] = {}
     arenas: dict[str, ArenaInfo] = {}
     factories_found: dict[str, FactoryInfo] = {}
     with zipfile.ZipFile(candidate.path) as zf:
@@ -510,8 +734,10 @@ def _read_pk3(candidate: _Candidate) -> _ProviderRecord:
             if stem is not None:
                 has_aas = f"maps/{stem}.aas" in members
                 has_levelshot = any(
-                    f"levelshots/{stem}.{ext}" in members for ext in ("jpg", "tga", "png"))
-                maps[stem] = (has_aas, has_levelshot)
+                    f"levelshots/{stem}.{ext}" in members for ext in _IMAGE_EXTENSIONS)
+                has_preview = any(
+                    f"levelshots/preview/{stem}.{ext}" in members for ext in _IMAGE_EXTENSIONS)
+                maps[stem] = (has_aas, has_levelshot, has_preview)
         for lowered in _info_members(members, _STOCK_ARENAS, ".arena"):
             member = members[lowered]
             source = f"{candidate.path}:{member}"
@@ -550,7 +776,9 @@ class _MapCache:
         self.entities: collections.OrderedDict[tuple[str, int, str], list[MapEntity]] = collections.OrderedDict()
 
     def clear(self) -> None:
+        global _workshop_reported
         with self.lock:
+            _workshop_reported = None  # re-log the scan next time round
             self.records.clear()
             self.fingerprint = ()
             self.last_stat = None
@@ -604,9 +832,10 @@ class _MapCache:
         factories_by_id: dict[str, FactoryInfo] = {}
         for candidate in candidates:
             record = self.records[candidate.path]
-            for name, (has_aas, has_levelshot) in record.maps.items():
+            for name, (has_aas, has_levelshot, has_preview) in record.maps.items():
                 sources_by_map.setdefault(name, []).append(
-                    MapSource(candidate.path, candidate.workshop_id, has_aas, has_levelshot))
+                    MapSource(candidate.path, candidate.workshop_id,
+                              has_aas, has_levelshot, has_preview))
             arenas.update(record.arenas)
             factories_by_id.update(record.factories)
 

@@ -66,7 +66,13 @@ Configuration
 =============
 minqlxtended is configured with cvars, like `qzeroded` itself, so `server.cfg` or `+set` on the command line both work. Everything has a default except `qlx_owner`, which must hold your SteamID64. The listed owner operates outside the permission system and can execute any command, raw Python included.
 
-The [Configuration](https://github.com/tjone270/minqlxtended/wiki/Configuration) wiki page lists every cvar: the core and database settings, logging, server-side demo recording, the reliable command guard and the team scoreboard trim. For plugin cvars see the [plugins repository](https://github.com/tjone270/minqlxtended-plugins).
+The [Configuration](https://github.com/tjone270/minqlxtended/wiki/Configuration) wiki page lists every cvar: the core and database settings, logging, server-side demo recording and streaming, the reliable command guard and the team scoreboard trim. For plugin cvars see the [plugins repository](https://github.com/tjone270/minqlxtended-plugins).
+
+What's new in v1.1.0
+====================
+- **Live demo streaming.** The same per-player blocks the recorder writes to `.dm_91` can go to a relay over TCP instead, so a custom client can watch any point of view live without taking a server slot. The reference relay in `tools/` takes any number of servers and files each one's POVs under its Steam account ID. `qlx_stream` reports the link.
+- **Workshop maps come from `sv_workshopFile`.** The scan reads the engine's own item list and keeps the ids that also have a directory on disk, so an item Steam still holds after you dropped it from the configuration is no longer offered. Workshop content now sits at the bottom of the search path, where the engine puts it, so a workshop pk3 no longer overrides stock content.
+- **`MapSource.has_preview`** tells you whether a pk3 carries the map's `levelshots/preview/` thumbnail.
 
 What's new in v1.0.0
 ====================
@@ -106,7 +112,7 @@ Four build targets, each with its own object directory:
 ```
 make              # bin/minqlxtended.x64.so, plus the Python package as bin/minqlxtended.zip
 make debug        # -O0 -g, and DEBUG defined
-make nopy         # no embedded interpreter; the hooks and the demo recorder only
+make nopy         # no embedded interpreter; the hooks, the demo recorder and the stream only
 make nopy_debug
 make clean
 ```

@@ -32,6 +32,9 @@ typedef enum {
     PROF_FRAME_DISPATCH,  // FrameDispatcher: handle_frame, task drain, frame event.
     PROF_DEMO_DISPATCH,   // DispatchFinishedDemos.
     PROF_DEMO_CAPTURE,    // Demo_Capture, once per outgoing message per recorded client.
+    PROF_STREAM_CAPTURE,  // Stream_Block, once per outgoing message per streamed client.
+    PROF_STREAM_FRAME,    // Stream_Frame: publishing map changes and forcing resyncs.
+    PROF_STREAM_STATE,    // StreamStateDispatcher, once per link transition.
     PROF_CLIENT_COMMAND,
     PROF_SERVER_COMMAND,
     PROF_SET_CONFIGSTRING,

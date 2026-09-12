@@ -36,6 +36,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "engine/quake_common.h"
 #include "features/reliable.h"
 #include "features/scoreboard.h"
+#include "features/stream.h"
 
 // Registered from InitializeStatic, long before InitializeCvars and InitializeVm populate
 // sv_maxclients, g_entities and svs. A `stopfollowing 0` exec'd from a cfg before the first map
@@ -138,6 +139,26 @@ void __cdecl ProfileCommand(void) {
     }
 }
 
+// Reports where the POVs are going and what the link has dropped. See stream.h.
+void __cdecl StreamCommand(void) {
+    const char* arg = Cmd_Argc() > 1 ? Cmd_Argv(1) : "";
+
+    if (!strcmp(arg, "reset")) {
+        Stream_Reset();
+        ENGINE_PRINTF("Counters reset.\n");
+    } else if (!strcmp(arg, "reconnect")) {
+        Stream_Reconnect();
+        ENGINE_PRINTF("Dropping the link; it will be dialled again straight away.\n");
+    } else if (!strcmp(arg, "resync")) {
+        Stream_ResyncAll();
+        ENGINE_PRINTF("Every open POV will send a full snapshot, one client per frame.\n");
+    } else if (arg[0]) {
+        ENGINE_PRINTF("Usage: %s [reset|reconnect|resync]\n", Cmd_Argv(0));
+    } else {
+        Stream_Report();
+    }
+}
+
 // Both hang off hooks that only exist in a Python build. See the matching guard on their
 // registration in dllmain.c.
 #ifndef NOPY
@@ -200,7 +221,7 @@ void __cdecl PyRcon(void) {
     RconDispatcher(Cmd_Args());
 }
 
-void __cdecl PyCommand(void) {
+static void DispatchCustomCommand(const char* line) {
     if (!custom_command_handler) {
         return; // No registered handler.
     }
@@ -219,7 +240,7 @@ void __cdecl PyCommand(void) {
         return;
     }
 
-    PyObject* result = PyObject_CallFunction(handler, "s", Cmd_Args());
+    PyObject* result = PyObject_CallFunction(handler, "s", line);
     if (result == Py_False) {
         ENGINE_PRINTF("The command failed to be executed. pyminqlxtended found no handler.\n");
     }
@@ -228,6 +249,24 @@ void __cdecl PyCommand(void) {
     Py_DECREF(handler);
     PROF_END(PROF_CUSTOM_COMMAND, t_work);
     DispatcherRelease(gstate);
+}
+
+// "pycmd", whose argument is itself a minqlxtended command: `pycmd !balance` runs `!balance`.
+void __cdecl PyPrefixCommand(void) {
+    DispatchCustomCommand(Cmd_Args());
+}
+
+// Everything add_console_command() registered. CommandInvoker.handle_input matches on the first
+// word it is given, so the command's own name has to lead.
+void __cdecl PyCommand(void) {
+    char        line[MAX_STRING_CHARS];
+    const char* name = Cmd_Argv(0);
+    const char* args = Cmd_Args();
+
+    snprintf(line, sizeof(line), "%s%s%s", name ? name : "", (args && args[0]) ? " " : "",
+             args ? args : "");
+
+    DispatchCustomCommand(line);
 }
 
 #endif

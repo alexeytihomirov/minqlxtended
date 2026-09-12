@@ -38,6 +38,7 @@ HOOKS = os.path.join(REPO, "src", "server", "hooks.c")
 ENGINE_FIELDS = os.path.join(REPO, "src", "python", "engine_fields.h")
 QUAKE_COMMON = os.path.join(REPO, "src", "engine", "quake_common.h")
 EMBED = os.path.join(REPO, "src", "python", "python_embed.c")
+MAPINFO = os.path.join(REPO, "python", "minqlxtended", "_mapinfo.py")
 OBJECTS = os.path.join(REPO, "src", "python", "python_objects.c")
 CONFIGSTRING = os.path.join(REPO, "python", "minqlxtended", "_configstring.py")
 
@@ -247,12 +248,49 @@ def check_python_h_comes_first(fail):
              f"features.h set: {', '.join(offenders)}")
 
 
+def check_workshop_roots_are_documented(fail):
+    """The cvars _mapinfo derives its workshop roots from, against the ones its docstring names.
+
+    An operator reads that docstring to work out whether their layout is covered, so a new
+    input to the derivation has to appear in both places."""
+    import ast
+
+    source = read(MAPINFO)
+    tree = ast.parse(source)
+    doc = (ast.get_docstring(tree) or "").lower()
+
+    func = next((n for n in tree.body
+                 if isinstance(n, ast.FunctionDef) and n.name == "_workshop_candidates"), None)
+    if func is None:
+        fail("could not find _workshop_candidates in _mapinfo.py; if it was renamed, update "
+             "this check rather than deleting it")
+        return
+
+    cvars = set()
+    for node in ast.walk(func):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get_cvar" and node.args
+                and isinstance(node.args[0], ast.Constant)):
+            cvars.add(node.args[0].value)
+
+    if not cvars:
+        fail("_workshop_candidates reads no cvars; if it now derives the roots some other "
+             "way, update this check rather than deleting it")
+        return
+
+    missing = sorted(name for name in cvars if name.lower() not in doc)
+    if missing:
+        fail(f"_mapinfo derives its workshop roots from {', '.join(missing)}, which its "
+             f"module docstring does not mention")
+
+
 CHECKS = (
     check_configstring_skip_list,
     check_python_h_comes_first,
     check_writable_structs_have_an_end_bound,
     check_natives_gate_the_game_module,
     check_views_gate_the_game_module,
+    check_workshop_roots_are_documented,
 )
 
 

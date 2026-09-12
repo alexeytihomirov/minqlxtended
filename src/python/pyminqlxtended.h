@@ -84,6 +84,7 @@ extern PyObject* kamikaze_use_handler;
 extern PyObject* kamikaze_explode_handler;
 
 extern PyObject* demo_finished_handler;
+extern PyObject* demo_stream_handler;
 
 // Events sourced from the game module.
 extern PyObject* player_death_handler;
@@ -155,6 +156,7 @@ void ClientSpawnDispatcher(int client_id);
 void KamikazeUseDispatcher(int client_id);
 void KamikazeExplodeDispatcher(int client_id, int is_used_on_demand);
 void DemoFinishedDispatcher(int client_id, const char* path, long bytes, int discarded, int failed);
+void StreamStateDispatcher(int connected, const char* endpoint, const char* error);
 
 /* Events read out of the game module. killer_id is -1 when no client is responsible, mod is a
  * raw meansOfDeath_t and the team arguments are raw team_t values. RoundEndDispatcher carries

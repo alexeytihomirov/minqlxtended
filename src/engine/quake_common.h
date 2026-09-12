@@ -2076,6 +2076,7 @@ extern int *mp_autoActionState;     // demo/screenshot auto-action state
 void __cdecl My_Cmd_AddCommand(char *cmd, void *func);
 void __cdecl My_Sys_SetModuleOffset(char *moduleName, void *offset);
 void __cdecl My_SV_SendMessageToClient(msg_t *msg, client_t *client); // server-side demo tap
+void __cdecl My_G_RunFrame(int time);
 #ifndef NOPY
 void __cdecl My_SV_ExecuteClientCommand(client_t *cl, char *s, qboolean clientOK);
 void __cdecl My_SV_SendServerCommand(client_t *cl, char *fmt, ...);
@@ -2086,7 +2087,6 @@ void __cdecl My_Com_Printf(char *fmt, ...);
 cvar_t *__cdecl My_Cvar_Set2(const char *var_name, const char *value, qboolean force);
 void __cdecl My_SV_SpawnServer(char *server, qboolean killBots);
 // VM replacement functions for hooks.
-void __cdecl My_G_RunFrame(int time);
 void __cdecl My_G_InitGame(int levelTime, int randomSeed, int restart);
 char *__cdecl My_ClientConnect(int clientNum, qboolean firstTime, qboolean isBot);
 void __cdecl My_ClientSpawn(gentity_t *ent);
@@ -2104,6 +2104,12 @@ void __cdecl My_Touch_Item(gentity_t *ent, gentity_t *other, trace_t *trace);
 #define ENGINE_PRINTF My_Com_Printf
 #else
 #define ENGINE_PRINTF Com_Printf
+#endif
+
+#ifndef NOPY
+#define ENGINE_CVAR_SET2 My_Cvar_Set2
+#else
+#define ENGINE_CVAR_SET2 Cvar_Set2
 #endif
 
 // Matches a server command's first word, so "cs" never matches "cstr".
@@ -2145,6 +2151,7 @@ void __cdecl RegularPrint(void);         // "p"
 void __cdecl DownloadWorkshopItem(void); // "steam_downloadugcdefer"
 void __cdecl StopFollowing(void);        // "stopfollowing"
 void __cdecl ProfileCommand(void);       // "qlx_prof"
+void __cdecl StreamCommand(void);        // "qlx_stream"
 #ifndef NOPY
 void __cdecl ReliableCommand(void);   // "qlx_reliable"
 void __cdecl ScoreboardCommand(void); // "qlx_scoreboard"
@@ -2152,9 +2159,9 @@ void __cdecl PyPerfCommand(void);     // "qlx_pyperf"
 // PyRcon gives the owner the ability to execute pyminqlxtended commands as if the
 // owner executed them.
 void __cdecl PyRcon(void);
-// PyCommand is the handler for every console command added from Python. One handler for
-// all of them; it works out which one ran and redirects it.
+// One handler per shape of console command. See the notes on their definitions.
 void __cdecl PyCommand(void);
+void __cdecl PyPrefixCommand(void); // "pycmd"
 #endif
 
 #endif /* QUAKE_COMMON_H */

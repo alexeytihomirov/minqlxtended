@@ -602,6 +602,34 @@ void DemoFinishedDispatcher(int client_id, const char* path, long bytes, int dis
     DispatcherRelease(gstate);
 }
 
+// Called from the frame hook, on the game thread.
+void StreamStateDispatcher(int connected, const char* endpoint, const char* error) {
+    if (!demo_stream_handler) {
+        return; // No registered handler.
+    }
+
+    PROF_BEGIN(t_gil);
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    PROF_END(PROF_GIL_WAIT, t_gil);
+    PROF_BEGIN(t_work);
+
+    PyObject* argv[] = {
+        Py_NewRef(connected ? Py_True : Py_False),
+        FromEngine(endpoint),
+        FromEngine(error),
+    };
+    PyObject* result = CallHandler(&demo_stream_handler, argv, 3);
+
+    if (result == NULL) {
+        DebugError("CallHandler() returned NULL.\n",
+                   __FILE__, __LINE__, __func__);
+    }
+    Py_XDECREF(result);
+
+    PROF_END(PROF_STREAM_STATE, t_work);
+    DispatcherRelease(gstate);
+}
+
 /*
  * The dispatchers below all run on the game thread, from the frame poll in game_events.c
  * or a hook, so the level still exists when the handler runs.

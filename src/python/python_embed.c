@@ -31,6 +31,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "features/console_command.h"
 #include "features/demos.h"
 #include "features/reliable.h"
+#include "features/stream.h"
 #include "pyminqlxtended.h"
 #include "python_objects.h"
 
@@ -52,6 +53,7 @@ PyObject* kamikaze_use_handler     = NULL;
 PyObject* kamikaze_explode_handler = NULL;
 
 PyObject* demo_finished_handler = NULL;
+PyObject* demo_stream_handler   = NULL;
 
 PyObject* player_death_handler = NULL;
 PyObject* round_countdown_handler = NULL;
@@ -115,6 +117,7 @@ static handler_t handlers[] = {
     {"kamikaze_explode", &kamikaze_explode_handler},
 
     {"demo_finished", &demo_finished_handler},
+    {"demo_stream", &demo_stream_handler},
 
     {"player_death", &player_death_handler},
     {"round_countdown", &round_countdown_handler},
@@ -325,6 +328,55 @@ static PyStructSequence_Desc reliable_status_desc = {
     "A snapshot of the reliable server-command channel's backpressure.",
     reliable_status_fields,
     (sizeof(reliable_status_fields) / sizeof(PyStructSequence_Field)) - 1};
+
+// One streamed point of view, from stream.c.
+static PyTypeObject stream_slot_type = {0};
+
+static PyStructSequence_Field stream_slot_fields[] = {
+    {"slot", "The client slot this describes."},
+    {"active", "Whether a point of view is open for the slot."},
+    {"desynced", "Whether blocks were lost and the relay is waiting on a full snapshot."},
+    {"resyncing", "Whether a full snapshot has been asked for and not yet seen."},
+    {"requested", "1 if the slot is explicitly streamed, -1 if explicitly excluded, 0 if following the cvars."},
+    {"gen", "Bumped every time the slot's point of view is opened."},
+    {"name", "The player's name as it was when the point of view opened."},
+    {NULL}};
+
+static PyStructSequence_Desc stream_slot_desc = {
+    "StreamSlot",
+    "The live-streaming state of one client slot.",
+    stream_slot_fields,
+    (sizeof(stream_slot_fields) / sizeof(PyStructSequence_Field)) - 1};
+
+// The demo stream, from stream.c.
+static PyTypeObject stream_status_type = {0};
+
+static PyStructSequence_Field stream_status_fields[] = {
+    {"enabled", "Whether sv_demoStream is set and an endpoint is configured."},
+    {"connected", "Whether the handshake is complete and blocks are going out."},
+    {"endpoint", "The relay being streamed to as \"host:port\", or an empty string."},
+    {"fingerprint", "A hash of the shared token. The token itself is never exposed."},
+    {"pending", "Bytes still in the ring, waiting for the stream thread."},
+    {"lag", "Milliseconds the oldest queued block has been waiting."},
+    {"high_water", "The deepest the ring has been since the counters were reset."},
+    {"sent", "Bytes sent to the socket."},
+    {"frames", "Protocol frames sent to the socket."},
+    {"dropped_ring", "Blocks dropped because the ring was full."},
+    {"dropped_link", "Blocks dropped because the link was down."},
+    {"dropped_stall", "Blocks dropped because the relay stopped reading."},
+    {"dropped_lag", "Blocks dropped for being further behind than sv_demoStreamMaxLag."},
+    {"gaps", "Gap frames sent, each declaring that a point of view lost blocks."},
+    {"resyncs", "Full snapshots forced to restart a point of view."},
+    {"reconnects", "Handshakes completed after the first one."},
+    {"error", "The last transport error, or None."},
+    {"slots", "A StreamSlot per client slot, as a tuple."},
+    {NULL}};
+
+static PyStructSequence_Desc stream_status_desc = {
+    "StreamStatus",
+    "A snapshot of the live demo stream.",
+    stream_status_fields,
+    (sizeof(stream_status_fields) / sizeof(PyStructSequence_Field)) - 1};
 
 // Indexed straight by powerup_t. Not the Powerups sequence, which covers only
 // PW_QUAD..PW_INVULNERABILITY and skips PW_FLIGHT.
@@ -2415,6 +2467,113 @@ static PyObject* PyMinqlxtended_ReliableStatus(PyObject* self, PyObject* args) {
     return status;
 }
 
+// start_stream/stop_stream/stream_status
+
+static PyObject* PyMinqlxtended_StartStream(PyObject* self, PyObject* args) {
+    int client_id;
+    if (!PyArg_ParseTuple(args, "i:start_stream", &client_id)) {
+        return NULL;
+    }
+
+    if (!qlx_on_game_thread("start_stream()") || !qlx_valid_client_id(client_id)) {
+        return NULL;
+    }
+
+    if (!Stream_Request(client_id, 1)) {
+        Py_RETURN_FALSE;
+    }
+
+    // A point of view has to begin at a gamestate, as a demo does, so a client already in the
+    // game starts at their next one. True means blocks are going out now.
+    return PyBool_FromLong(Stream_IsStreaming(client_id) == qtrue);
+}
+
+static PyObject* PyMinqlxtended_StopStream(PyObject* self, PyObject* args) {
+    int client_id;
+    if (!PyArg_ParseTuple(args, "i:stop_stream", &client_id)) {
+        return NULL;
+    }
+
+    if (!qlx_on_game_thread("stop_stream()") || !qlx_valid_client_id(client_id)) {
+        return NULL;
+    }
+
+    qboolean was_streaming = Stream_IsStreaming(client_id);
+    // -1 so this also overrides sv_demoStream being on globally.
+    if (!Stream_Request(client_id, -1)) {
+        Py_RETURN_FALSE;
+    }
+
+    return PyBool_FromLong(was_streaming == qtrue);
+}
+
+// Walks the per-slot arrays stream.c keeps for the game thread alone, so the guard is required
+// even though reliable_status() next door needs none.
+static PyObject* PyMinqlxtended_StreamStatus(PyObject* self, PyObject* args) {
+    if (!qlx_on_game_thread("stream_status()")) {
+        return NULL;
+    }
+
+    stream_status_t ss;
+    Stream_Status(&ss);
+
+    PyObject* slots = PyTuple_New(ss.slot_count);
+    if (slots == NULL) {
+        return NULL;
+    }
+    for (int i = 0; i < ss.slot_count; i++) {
+        PyObject* slot = PyStructSequence_New(&stream_slot_type);
+        if (slot == NULL) {
+            Py_DECREF(slots);
+            return NULL;
+        }
+        PyStructSequence_SetItem(slot, 0, PyLong_FromLong(ss.slots[i].slot));
+        PyStructSequence_SetItem(slot, 1, PyBool_FromLong(ss.slots[i].active));
+        PyStructSequence_SetItem(slot, 2, PyBool_FromLong(ss.slots[i].desynced));
+        PyStructSequence_SetItem(slot, 3, PyBool_FromLong(ss.slots[i].resyncing));
+        PyStructSequence_SetItem(slot, 4, PyLong_FromLong(ss.slots[i].requested));
+        PyStructSequence_SetItem(slot, 5, PyLong_FromUnsignedLong(ss.slots[i].gen));
+        PyStructSequence_SetItem(slot, 6, PyUnicode_DecodeUTF8(ss.slots[i].name,
+                                                              (Py_ssize_t)strlen(ss.slots[i].name),
+                                                              "ignore"));
+        PyTuple_SET_ITEM(slots, i, slot);
+    }
+
+    PyObject* status = PyStructSequence_New(&stream_status_type);
+    if (status == NULL) {
+        Py_DECREF(slots);
+        return NULL;
+    }
+
+    PyObject* error;
+    if (ss.error[0]) {
+        error = PyUnicode_DecodeUTF8(ss.error, (Py_ssize_t)strlen(ss.error), "ignore");
+    } else {
+        error = Py_NewRef(Py_None);
+    }
+
+    PyStructSequence_SetItem(status, 0, PyBool_FromLong(ss.enabled));
+    PyStructSequence_SetItem(status, 1, PyBool_FromLong(ss.connected));
+    PyStructSequence_SetItem(status, 2, PyUnicode_FromString(ss.endpoint));
+    PyStructSequence_SetItem(status, 3, PyUnicode_FromString(ss.fingerprint));
+    PyStructSequence_SetItem(status, 4, PyLong_FromUnsignedLong(ss.pending));
+    PyStructSequence_SetItem(status, 5, PyLong_FromUnsignedLong(ss.lag));
+    PyStructSequence_SetItem(status, 6, PyLong_FromUnsignedLong(ss.high_water));
+    PyStructSequence_SetItem(status, 7, PyLong_FromUnsignedLongLong(ss.sent));
+    PyStructSequence_SetItem(status, 8, PyLong_FromUnsignedLongLong(ss.frames));
+    PyStructSequence_SetItem(status, 9, PyLong_FromUnsignedLong(ss.dropped_ring));
+    PyStructSequence_SetItem(status, 10, PyLong_FromUnsignedLong(ss.dropped_link));
+    PyStructSequence_SetItem(status, 11, PyLong_FromUnsignedLong(ss.dropped_stall));
+    PyStructSequence_SetItem(status, 12, PyLong_FromUnsignedLong(ss.dropped_lag));
+    PyStructSequence_SetItem(status, 13, PyLong_FromUnsignedLong(ss.gaps));
+    PyStructSequence_SetItem(status, 14, PyLong_FromUnsignedLong(ss.resyncs));
+    PyStructSequence_SetItem(status, 15, PyLong_FromUnsignedLong(ss.reconnects));
+    PyStructSequence_SetItem(status, 16, error);
+    PyStructSequence_SetItem(status, 17, slots);
+
+    return status;
+}
+
 // Module definition and initialization
 
 static PyMethodDef minqlxtendedMethods[] = {
@@ -2456,7 +2615,9 @@ static PyMethodDef minqlxtendedMethods[] = {
     {"force_vote", PyMinqlxtended_ForceVote, METH_VARARGS,
      "Forces the current vote to either fail or pass."},
     {"add_console_command", PyMinqlxtended_AddConsoleCommand, METH_VARARGS,
-     "Adds a console command that will be handled by Python code."},
+     "add_console_command(name) -- register a console command handled by Python.\n\n"
+     "The whole line goes to the command invoker, name first, so a Command registered under "
+     "the same name and reachable from the console channel is what runs."},
     {"register_handler", PyMinqlxtended_RegisterHandler, METH_VARARGS,
      "Register an event handler. Can be called more than once per event, but only the last one will work."},
     {"entities", (PyCFunction)(void (*)(void))PyMinqlxtended_Entities,
@@ -2519,6 +2680,19 @@ static PyMethodDef minqlxtendedMethods[] = {
      "reliable_status() -- a ReliableStatus snapshot of the reliable command channel.\n\n"
      "The backlog field is the deepest live per-client backlog out of the 64-slot ring; "
      "a plugin about to mass-message can pace itself against it."},
+    {"start_stream", PyMinqlxtended_StartStream, METH_VARARGS,
+     "start_stream(client_id) -- stream this player's point of view, overriding sv_demoStream "
+     "and sv_demoStreamSlots.\n\n"
+     "A point of view can only begin at a gamestate, so a player already in the game starts at "
+     "their next one. True means blocks are going out now; a queued request returns False. A "
+     "host must still be configured."},
+    {"stop_stream", PyMinqlxtended_StopStream, METH_VARARGS,
+     "stop_stream(client_id) -- stop streaming this player and close their point of view, even "
+     "if sv_demoStream is on."},
+    {"stream_status", PyMinqlxtended_StreamStatus, METH_NOARGS,
+     "stream_status() -- a StreamStatus snapshot of the live demo stream.\n\n"
+     "slots holds a StreamSlot per client slot. A desynced point of view has lost blocks and "
+     "starts again at the next full snapshot. Game thread only."},
     {"drop_item", PyMinqlxtended_DropItem, METH_VARARGS,
      "drop_item(client_id, item_id, angle=0.0) -- launch a dropped copy of the item "
      "from the player, returning the new entity's id, or None if nothing spawned.\n\n"
@@ -3233,6 +3407,8 @@ static PyObject* PyMinqlxtended_InitModule(void) {
     PyStructSequence_InitType(&keys_type, &keys_desc);
     PyStructSequence_InitType(&demo_status_type, &demo_status_desc);
     PyStructSequence_InitType(&reliable_status_type, &reliable_status_desc);
+    PyStructSequence_InitType(&stream_slot_type, &stream_slot_desc);
+    PyStructSequence_InitType(&stream_status_type, &stream_status_desc);
     PyStructSequence_InitType(&stat_powerups_type, &stat_powerups_desc);
     PyStructSequence_InitType(&stat_holdables_type, &stat_holdables_desc);
     PyStructSequence_InitType(&player_expanded_stats_type, &player_expanded_stats_desc);
@@ -3252,6 +3428,8 @@ static PyObject* PyMinqlxtended_InitModule(void) {
         {&keys_type, &keys_desc},
         {&demo_status_type, &demo_status_desc},
         {&reliable_status_type, &reliable_status_desc},
+        {&stream_slot_type, &stream_slot_desc},
+        {&stream_status_type, &stream_status_desc},
         {&stat_powerups_type, &stat_powerups_desc},
         {&stat_holdables_type, &stat_holdables_desc},
         {&player_expanded_stats_type, &player_expanded_stats_desc},
@@ -3274,6 +3452,8 @@ static PyObject* PyMinqlxtended_InitModule(void) {
     Py_INCREF((PyObject*)&keys_type);
     Py_INCREF((PyObject*)&demo_status_type);
     Py_INCREF((PyObject*)&reliable_status_type);
+    Py_INCREF((PyObject*)&stream_slot_type);
+    Py_INCREF((PyObject*)&stream_status_type);
     Py_INCREF((PyObject*)&stat_powerups_type);
     Py_INCREF((PyObject*)&stat_holdables_type);
     Py_INCREF((PyObject*)&player_expanded_stats_type);
@@ -3288,6 +3468,8 @@ static PyObject* PyMinqlxtended_InitModule(void) {
     PyModule_AddObject(module, "Keys", (PyObject*)&keys_type);
     PyModule_AddObject(module, "DemoStatus", (PyObject*)&demo_status_type);
     PyModule_AddObject(module, "ReliableStatus", (PyObject*)&reliable_status_type);
+    PyModule_AddObject(module, "StreamSlot", (PyObject*)&stream_slot_type);
+    PyModule_AddObject(module, "StreamStatus", (PyObject*)&stream_status_type);
     PyModule_AddObject(module, "StatPowerups", (PyObject*)&stat_powerups_type);
     PyModule_AddObject(module, "StatHoldables", (PyObject*)&stat_holdables_type);
     PyModule_AddObject(module, "PlayerExpandedStats", (PyObject*)&player_expanded_stats_type);
