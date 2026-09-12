@@ -104,6 +104,7 @@ player_die_ptr player_die;
 Touch_Item_ptr Touch_Item;
 LaunchItem_ptr LaunchItem;
 Drop_Item_ptr Drop_Item;
+RespawnItem_ptr RespawnItem;
 G_StartKamikaze_ptr G_StartKamikaze;
 G_FreeEntity_ptr G_FreeEntity;
 G_SpawnGEntityFromSpawnVars_ptr G_SpawnGEntityFromSpawnVars;
@@ -449,6 +450,16 @@ void SearchVmFunctions(void) {
                    "will not be available.\n");
     } else {
         DebugPrint("G_SpawnGEntityFromSpawnVars: %p\n", G_SpawnGEntityFromSpawnVars);
+    }
+
+    // Tolerated: only respawn_item() needs it, and it raises unresolved.
+    RespawnItem = (RespawnItem_ptr)PatternSearch((void*)((pint)qagame + 0xB000), 0xB0000,
+                                                 PTRN_RESPAWNITEM, MASK_RESPAWNITEM);
+    if (RespawnItem == NULL) {
+        DebugPrint("WARNING: Unable to find RespawnItem. respawn_item() will not be "
+                   "available.\n");
+    } else {
+        DebugPrint("RespawnItem: %p\n", RespawnItem);
     }
 
     if (failed) {

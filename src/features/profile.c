@@ -84,6 +84,7 @@ static const char* const prof_names[PROF_COUNT] = {
     "weapon_fired",
     "damage",
     "cvar_changed",
+    "item_touch",
     "game event poll",
 };
 

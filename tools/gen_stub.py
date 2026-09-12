@@ -217,6 +217,7 @@ SIGNATURES = {
     "stop_stream": "(client_id: int, /) -> bool",
     "stream_status": "() -> StreamStatus",
     "drop_item": "(client_id: int, item_id: int, angle: float = ..., /) -> int | None",
+    "respawn_item": "(entity_id: int, delay: int, /) -> bool",
     "remove_entity": "(entity_id: int, /) -> bool",
     "spawn_entity": ("(classname: str, keys: dict[str, str | int | float | "
                      "Sequence[float]] | None = ..., /) -> Entity | None"),

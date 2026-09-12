@@ -68,6 +68,7 @@ typedef enum {
     PROF_WEAPON_FIRED, // Gated: no samples unless something has hooked `weapon_fired`.
     PROF_DAMAGE,       // Gated: no samples at all unless something has hooked `damage`.
     PROF_CVAR_CHANGED, // Gated: no samples unless something has hooked `cvar_changed`.
+    PROF_ITEM_TOUCH,   // Gated: no samples unless something has hooked `item_touch`.
     PROF_GAME_EVENTS,  // GameEvents_Frame, the whole per-frame state poll.
     PROF_COUNT
 } prof_id_t;

@@ -93,7 +93,7 @@ class EventDispatcher:
     """
     name: str = ""
     no_debug = ("frame", "set_configstring", "stats", "server_command", "death", "kill", "command",
-                "console_print", "damage", "weapon_fired", "cvar_changed")
+                "console_print", "damage", "weapon_fired", "cvar_changed", "item_touch")
     need_zmq_stats_enabled = False
 
     gated_handler: str | None = None
@@ -961,6 +961,28 @@ class ItemPickupDispatcher(EventDispatcher):
         return super().dispatch(player, item_name)
 
 
+class ItemTouchDispatcher(EventDispatcher):
+    """Event that goes off whenever a player touches an item, before the game decides whether
+    it's a pickup. ``entity`` is the item's :class:`minqlxtended.Entity`.
+
+    Most touches aren't pickups: a player standing on an item they can't take touches it
+    again and again, so hook ``item_pickup`` for pickups. Returning
+    :attr:`~minqlxtended.Return.STOP_EVENT` or :attr:`~minqlxtended.Return.STOP_ALL` keeps
+    the touch from the game, and the item stays where it is.
+
+    Like ``damage``, this event is **gated**: the engine doesn't call into Python for it
+    until something hooks it. Keep handlers cheap.
+
+    """
+    name = "item_touch"
+    gated_handler = "item_touch"
+    gated_dispatch_fn = "handle_item_touch"
+
+    @override
+    def dispatch(self, player, entity):
+        return super().dispatch(player, entity)
+
+
 class DemoFinishedDispatcher(EventDispatcher):
     """Event that goes off when a server-side demo has been written and closed. Carries a
     client id rather than a :class:`minqlxtended.Player`, since the player may have left."""
@@ -1021,3 +1043,4 @@ EVENT_DISPATCHERS.add_dispatcher(ObjectiveDispatcher)
 EVENT_DISPATCHERS.add_dispatcher(WeaponFiredDispatcher)
 EVENT_DISPATCHERS.add_dispatcher(UserinfoDispatcher)
 EVENT_DISPATCHERS.add_dispatcher(ItemPickupDispatcher)
+EVENT_DISPATCHERS.add_dispatcher(ItemTouchDispatcher)

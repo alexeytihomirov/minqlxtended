@@ -1201,3 +1201,37 @@ void CvarChangedDispatcher(const char* name, const char* old_value, const char* 
     PROF_END(PROF_CVAR_CHANGED, t_work);
     DispatcherRelease(gstate);
 }
+
+/*
+ * An item trigger being touched, before Touch_Item. Gated like damage, and My_Touch_Item tests
+ * the slot before calling in. Cancellable, the way team_switch_attempt is.
+ */
+int ItemTouchDispatcher(int client_id, int entity_id) {
+    int ret = 1;
+    if (!item_touch_handler) {
+        return ret; // Nothing has hooked the event.
+    }
+
+    PROF_BEGIN(t_gil);
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    PROF_END(PROF_GIL_WAIT, t_gil);
+    PROF_BEGIN(t_work);
+
+    PyObject* argv[] = {
+        PyLong_FromLong(client_id),
+        PyLong_FromLong(entity_id),
+    };
+    PyObject* result = CallHandler(&item_touch_handler, argv, 2);
+
+    if (result == NULL) {
+        DebugError("CallHandler() returned NULL.\n",
+                   __FILE__, __LINE__, __func__);
+    } else if (PyBool_Check(result) && result == Py_False) {
+        ret = 0;
+    }
+    Py_XDECREF(result);
+
+    PROF_END(PROF_ITEM_TOUCH, t_work);
+    DispatcherRelease(gstate);
+    return ret;
+}

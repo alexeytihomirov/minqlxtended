@@ -1956,6 +1956,9 @@ typedef void (*player_die_ptr)(gentity_t *self, gentity_t *inflictor, gentity_t 
 typedef void(__cdecl *Touch_Item_ptr)(gentity_t *ent, gentity_t *other, trace_t *trace);
 typedef gentity_t *(__cdecl *LaunchItem_ptr)(gitem_t *item, vec3_t origin, vec3_t velocity);
 typedef gentity_t *(__cdecl *Drop_Item_ptr)(gentity_t *ent, gitem_t *item, float angle);
+// No __cdecl, so this stays assignment-compatible with gentity_t.think, which is declared
+// without it.
+typedef void (*RespawnItem_ptr)(gentity_t *ent);
 typedef void(__cdecl *G_StartKamikaze_ptr)(gentity_t *ent);
 typedef void(__cdecl *G_FreeEntity_ptr)(gentity_t *ed);
 // Declared void although the engine's returns a gentity_t*: several paths through it
@@ -2028,6 +2031,7 @@ extern player_die_ptr player_die;
 extern Touch_Item_ptr Touch_Item;
 extern LaunchItem_ptr LaunchItem;
 extern Drop_Item_ptr Drop_Item;
+extern RespawnItem_ptr RespawnItem; // NULL if the pattern did not match
 extern G_StartKamikaze_ptr G_StartKamikaze;
 extern G_FreeEntity_ptr G_FreeEntity;
 extern G_SpawnGEntityFromSpawnVars_ptr G_SpawnGEntityFromSpawnVars; // NULL if the pattern did not match

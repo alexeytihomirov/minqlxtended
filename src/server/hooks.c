@@ -492,10 +492,24 @@ void __cdecl My_ClientSpawn(gentity_t* ent) {
 // Touch_Item runs for every touch of an item trigger and most are rejected before pickupCount is
 // bumped, so diffing pickupCount separates a pickup from a touch. SVF_NOCLIENT will not serve:
 // with g_itemTimers on, Touch_Item sets and clears it for any item carrying a timer.
+//
+// item_touch goes out first, gated like damage, so a handler can keep the touch from reaching
+// Touch_Item at all. A handler can also free the item or drop the player, and G_FreeEntity zeroes
+// the entity (a zero modelindex is an ERR_DROP out of Q3's BG_CanItemBeGrabbed), so both are
+// looked at again before Touch_Item gets them.
 void __cdecl My_Touch_Item(gentity_t* ent, gentity_t* other, trace_t* trace) {
     if (!ent || !other || !other->client) {
         Touch_Item(ent, other, trace);
         return;
+    }
+
+    if (item_touch_handler) {
+        if (!ItemTouchDispatcher((int)(other - g_entities), (int)(ent - g_entities))) {
+            return;
+        }
+        if (!ent->inuse || !other->inuse || !other->client) {
+            return;
+        }
     }
 
     int picked_up_before = ent->pickupCount;
