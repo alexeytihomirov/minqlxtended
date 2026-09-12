@@ -27,6 +27,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <structseq.h>
 
 #include "common.h"
+#include "features/demo_match.h"
 #include "engine/quake_common.h"
 #include "features/console_command.h"
 #include "features/demos.h"
@@ -53,6 +54,8 @@ PyObject* kamikaze_use_handler     = NULL;
 PyObject* kamikaze_explode_handler = NULL;
 
 PyObject* demo_finished_handler = NULL;
+PyObject* demo_recording_started_handler = NULL;
+PyObject* demo_match_finalized_handler = NULL;
 PyObject* demo_stream_handler   = NULL;
 
 PyObject* player_death_handler = NULL;
@@ -117,6 +120,8 @@ static handler_t handlers[] = {
     {"kamikaze_explode", &kamikaze_explode_handler},
 
     {"demo_finished", &demo_finished_handler},
+    {"demo_recording_started", &demo_recording_started_handler},
+    {"demo_match_finalized", &demo_match_finalized_handler},
     {"demo_stream", &demo_stream_handler},
 
     {"player_death", &player_death_handler},
@@ -724,6 +729,29 @@ static PyObject* PyMinqlxtended_PlayersInfo(PyObject* self, PyObject* args) {
     }
 
     return ret;
+}
+
+// demo_arm
+
+static PyObject* PyMinqlxtended_DemoArm(PyObject* self, PyObject* args) {
+    const char* match_id;
+    const char* map_name;
+
+    if (!PyArg_ParseTuple(args, "ss:demo_arm", &match_id, &map_name)) {
+        return NULL;
+    }
+
+    DemoMatch_Arm(match_id, map_name);
+    Py_RETURN_NONE;
+}
+
+// demo_disarm
+
+static PyObject* PyMinqlxtended_DemoDisarm(PyObject* self, PyObject* args) {
+    (void)self;
+    (void)args;
+    DemoMatch_Disarm();
+    Py_RETURN_NONE;
 }
 
 // get_userinfo
@@ -2732,6 +2760,10 @@ static PyMethodDef minqlxtendedMethods[] = {
      "does.\n\n"
      "Unlinked entities stop colliding and stop being sent to clients; r.linked reads "
      "back False. Game thread only."},
+    {"demo_arm", PyMinqlxtended_DemoArm, METH_VARARGS,
+     "Arms native per-player demo recording for the current match (match_id, map_name)."},
+    {"demo_disarm", PyMinqlxtended_DemoDisarm, METH_NOARGS,
+     "Disarms native per-player demo recording, closing and finalising every open file."},
     {NULL, NULL, 0, NULL}};
 
 // "_minqlxtended" matches PyImport_AppendInittab. m_name becomes __name__, and if it disagrees
