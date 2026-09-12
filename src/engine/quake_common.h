@@ -2072,6 +2072,7 @@ extern int *mp_autoActionState;     // demo/screenshot auto-action state
 void __cdecl My_Cmd_AddCommand(char *cmd, void *func);
 void __cdecl My_Sys_SetModuleOffset(char *moduleName, void *offset);
 void __cdecl My_SV_SendMessageToClient(msg_t *msg, client_t *client); // server-side demo tap
+void __cdecl My_G_RunFrame(int time);
 #ifndef NOPY
 void __cdecl My_SV_ExecuteClientCommand(client_t *cl, char *s, qboolean clientOK);
 void __cdecl My_SV_SendServerCommand(client_t *cl, char *fmt, ...);
@@ -2082,7 +2083,6 @@ void __cdecl My_Com_Printf(char *fmt, ...);
 cvar_t *__cdecl My_Cvar_Set2(const char *var_name, const char *value, qboolean force);
 void __cdecl My_SV_SpawnServer(char *server, qboolean killBots);
 // VM replacement functions for hooks.
-void __cdecl My_G_RunFrame(int time);
 void __cdecl My_G_InitGame(int levelTime, int randomSeed, int restart);
 char *__cdecl My_ClientConnect(int clientNum, qboolean firstTime, qboolean isBot);
 void __cdecl My_ClientSpawn(gentity_t *ent);

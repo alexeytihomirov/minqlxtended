@@ -441,41 +441,6 @@ static void DispatchFinishedDemos(void) {
     }
 }
 
-void __cdecl My_G_RunFrame(int time) {
-    // Dropping frames is probably not a good idea, so we don't allow cancelling.
-    PROF_BEGIN(t_frame);
-
-    if (!sv_spawning) {
-        // What console_command() held back from worker threads. Before the dispatchers, so what
-        // they queue goes out next frame rather than partway through this one.
-        ConsoleCommand_Drain();
-
-        // Release whatever the guard held back last frame before the dispatchers get a
-        // chance to queue more, so the ring drains at a steady rate.
-        Reliable_Flush();
-
-        // Skips the frame hooks while the game is uninitialised. FrameDispatcher probes
-        // itself, so its figure leaves out the GIL wait as the other event probes do.
-        FrameDispatcher();
-
-        PROF_BEGIN(t_demos);
-        DispatchFinishedDemos();
-        PROF_END(PROF_DEMO_DISPATCH, t_demos);
-    }
-
-    G_RunFrame(time);
-
-    // After the engine's frame, so round transitions and team changes made during it are
-    // visible on the same frame they happen instead of one late.
-    if (!sv_spawning) {
-        GameEvents_Frame();
-    }
-
-    // The engine's own frame is in here too, so this is what we measure the other probes
-    // against. It isn't an overhead figure of its own.
-    PROF_END(PROF_FRAME_TOTAL, t_frame);
-}
-
 char* __cdecl My_ClientConnect(int clientNum, qboolean firstTime, qboolean isBot) {
     if (firstTime) {
         char* res = ClientConnectDispatcher(clientNum, isBot);
@@ -664,6 +629,42 @@ void __cdecl My_G_StartKamikaze(gentity_t* ent) {
 }
 #endif
 
+void __cdecl My_G_RunFrame(int time) {
+    // Dropping frames is probably not a good idea, so we don't allow cancelling.
+    PROF_BEGIN(t_frame);
+
+    if (!sv_spawning) {
+#ifndef NOPY
+        // Both before the dispatchers: what they queue then goes out next frame rather than
+        // partway through this one, and the reliable ring drains at a steady rate.
+        ConsoleCommand_Drain();
+        Reliable_Flush();
+
+        // Skips the frame hooks while the game is uninitialised. FrameDispatcher probes
+        // itself, so its figure leaves out the GIL wait as the other event probes do.
+        FrameDispatcher();
+
+        PROF_BEGIN(t_demos);
+        DispatchFinishedDemos();
+        PROF_END(PROF_DEMO_DISPATCH, t_demos);
+#endif
+    }
+
+    G_RunFrame(time);
+
+#ifndef NOPY
+    // After the engine's frame, so round transitions and team changes made during it are
+    // visible on the same frame they happen instead of one late.
+    if (!sv_spawning) {
+        GameEvents_Frame();
+    }
+#endif
+
+    // The engine's own frame is in here too, so this is what we measure the other probes
+    // against. It isn't an overhead figure of its own.
+    PROF_END(PROF_FRAME_TOTAL, t_frame);
+}
+
 // The server going away: `quit`, `killserver` and sv_killserver, Com_Error, and SV_Frame's
 // restart paths. SV_SpawnServer does not come through here, so this can finalise
 // unconditionally. Runs before the original, which Z_Free's svs.clients and then memsets svs.
@@ -845,11 +846,10 @@ void HookVm(void) {
     G_InitGame                                            = *(G_InitGame_ptr*)(vm_call_table + RELOFFSET_VM_CALL_INITGAME);
     *(void**)(vm_call_table + RELOFFSET_VM_CALL_INITGAME) = My_G_InitGame;
 
-    G_RunFrame = *(G_RunFrame_ptr*)(vm_call_table + RELOFFSET_VM_CALL_RUNFRAME);
-
-#ifndef NOPY
+    G_RunFrame                                            = *(G_RunFrame_ptr*)(vm_call_table + RELOFFSET_VM_CALL_RUNFRAME);
     *(void**)(vm_call_table + RELOFFSET_VM_CALL_RUNFRAME) = My_G_RunFrame;
 
+#ifndef NOPY
     // `count` must equal the number of SUCCESSFUL Hook() calls: Hook advances the trampoline
     // allocator only on success, and seek_hook_slot(-count) below rewinds by that many. The
     // unconditional count++ is safe because a failure sets `failed` and exits before the rewind.
