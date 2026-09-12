@@ -204,14 +204,20 @@ class CustomVoteManager:
         self._installed = True
 
     def _execute_pending(self, player, msg, channel):
+        logger = minqlxtended.get_logger()
         try:
             token = int(msg[1])
         except (IndexError, ValueError):
+            logger.warning("%s ran as %r, with no token. The vote it belongs to has already "
+                           "passed, so this does nothing.", self.EXECUTE_COMMAND, " ".join(msg))
             return
 
         entry = self._pending.pop(token, None)
-        if entry is not None:
-            entry[1]()
+        if entry is None:
+            logger.debug("%s %d has no callable waiting.", self.EXECUTE_COMMAND, token)
+            return
+
+        entry[1]()
 
     def _handle_map(self, mapname, factory):
         self._pending.clear()
