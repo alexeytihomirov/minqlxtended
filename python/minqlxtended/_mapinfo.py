@@ -66,6 +66,7 @@ __all__ = (
 _MAX_ENTITY_LUMP = 16 * 1024 * 1024
 _STAT_TTL = 30.0
 _ENTITY_CACHE_SIZE = 8
+_IMAGE_EXTENSIONS = ("jpg", "jpeg", "tga", "png")
 
 class MapSource(typing.NamedTuple):
     """One pk3 that carries a map. A map can have several; precedence decides which wins."""
@@ -77,6 +78,8 @@ class MapSource(typing.NamedTuple):
     has_aas: bool
     #: Whether the pk3 carries a levelshot for the map.
     has_levelshot: bool
+    #: Whether the pk3 carries the map's levelshots/preview/ thumbnail.
+    has_preview: bool = False
 
 
 class ArenaInfo(typing.NamedTuple):
@@ -391,12 +394,12 @@ class _ProviderRecord(typing.NamedTuple):
 
     mtime_ns: int
     size: int
-    maps: dict[str, tuple[bool, bool]]  # name -> (has_aas, has_levelshot)
+    maps: dict[str, tuple[bool, bool, bool]]  # name -> (has_aas, has_levelshot, has_preview)
     arenas: dict[str, ArenaInfo]
     factories: dict[str, FactoryInfo]
 
 
-_EMPTY_MAPS: dict[str, tuple[bool, bool]] = {}
+_EMPTY_MAPS: dict[str, tuple[bool, bool, bool]] = {}
 
 
 def _workshop_root() -> str | None:
@@ -500,7 +503,7 @@ def _info_members(members: dict[str, str], stock: str, suffix: str) -> list[str]
 
 
 def _read_pk3(candidate: _Candidate) -> _ProviderRecord:
-    maps: dict[str, tuple[bool, bool]] = {}
+    maps: dict[str, tuple[bool, bool, bool]] = {}
     arenas: dict[str, ArenaInfo] = {}
     factories_found: dict[str, FactoryInfo] = {}
     with zipfile.ZipFile(candidate.path) as zf:
@@ -510,8 +513,10 @@ def _read_pk3(candidate: _Candidate) -> _ProviderRecord:
             if stem is not None:
                 has_aas = f"maps/{stem}.aas" in members
                 has_levelshot = any(
-                    f"levelshots/{stem}.{ext}" in members for ext in ("jpg", "tga", "png"))
-                maps[stem] = (has_aas, has_levelshot)
+                    f"levelshots/{stem}.{ext}" in members for ext in _IMAGE_EXTENSIONS)
+                has_preview = any(
+                    f"levelshots/preview/{stem}.{ext}" in members for ext in _IMAGE_EXTENSIONS)
+                maps[stem] = (has_aas, has_levelshot, has_preview)
         for lowered in _info_members(members, _STOCK_ARENAS, ".arena"):
             member = members[lowered]
             source = f"{candidate.path}:{member}"
@@ -604,9 +609,10 @@ class _MapCache:
         factories_by_id: dict[str, FactoryInfo] = {}
         for candidate in candidates:
             record = self.records[candidate.path]
-            for name, (has_aas, has_levelshot) in record.maps.items():
+            for name, (has_aas, has_levelshot, has_preview) in record.maps.items():
                 sources_by_map.setdefault(name, []).append(
-                    MapSource(candidate.path, candidate.workshop_id, has_aas, has_levelshot))
+                    MapSource(candidate.path, candidate.workshop_id,
+                              has_aas, has_levelshot, has_preview))
             arenas.update(record.arenas)
             factories_by_id.update(record.factories)
 
