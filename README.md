@@ -68,6 +68,12 @@ minqlxtended is configured with cvars, like `qzeroded` itself, so `server.cfg` o
 
 The [Configuration](https://github.com/tjone270/minqlxtended/wiki/Configuration) wiki page lists every cvar: the core and database settings, logging, server-side demo recording and streaming, the reliable command guard and the team scoreboard trim. For plugin cvars see the [plugins repository](https://github.com/tjone270/minqlxtended-plugins).
 
+What's new in v1.1.0
+====================
+- **Live demo streaming.** The same per-player blocks the recorder writes to `.dm_91` can go to a relay over TCP instead, so a custom client can watch any point of view live without taking a server slot. The reference relay in `tools/` takes any number of servers and files each one's POVs under its Steam account ID. `qlx_stream` reports the link.
+- **Workshop maps come from `sv_workshopFile`.** The scan reads the engine's own item list and keeps the ids that also have a directory on disk, so an item Steam still holds after you dropped it from the configuration is no longer offered. Workshop content now sits at the bottom of the search path, where the engine puts it, so a workshop pk3 no longer overrides stock content.
+- **`MapSource.has_preview`** tells you whether a pk3 carries the map's `levelshots/preview/` thumbnail.
+
 What's new in v1.0.0
 ====================
 - **Events come from the game module.** `game_start`, `game_end`, `round_end`, `team_switch`, `kill` and `death` are read out of the engine, so you don't need `zmq_stats_enable 1` any more. The ZMQ listener is only there for plugins that want to hook the raw `stats` event.
@@ -76,8 +82,7 @@ What's new in v1.0.0
 - **Entities can be spawned, moved and removed** at runtime.
 - **The installed-map scan.** `installed_maps()`, `map_info()`, `factories()` and friends tell you what's installed and what gametypes each map declares.
 - **Server-side demo recording**, the reliable command guard and the team scoreboard trim, all described above.
-- **Live demo streaming.** The same per-player blocks the recorder writes to `.dm_91` can go to a relay over TCP instead, so a custom client can watch any point of view live without taking a server slot. The reference relay in `tools/` takes any number of servers and files each one's POVs under its Steam account ID.
-- **Three diagnostic console commands.** `qlx_prof` measures how much of the frame budget minqlxtended is using, `qlx_stream` reports the state of the demo stream, and `qlx_pyperf` turns on CPython's perf trampoline so `perf` can name Python functions.
+- **Two diagnostic console commands.** `qlx_prof` measures how much of the frame budget minqlxtended is using, and `qlx_pyperf` turns on CPython's perf trampoline so `perf` can name Python functions.
 
 The [wiki](https://github.com/tjone270/minqlxtended/wiki) covers all of it: [Writing Plugins](https://github.com/tjone270/minqlxtended/wiki/Writing-Plugins) and [Events](https://github.com/tjone270/minqlxtended/wiki/Events) to get started, [Engine Views](https://github.com/tjone270/minqlxtended/wiki/Engine-Views) for `level` and `Entity`, [Upgrading](https://github.com/tjone270/minqlxtended/wiki/Upgrading) to port an existing plugin, and [Internals](https://github.com/tjone270/minqlxtended/wiki/Internals) for the engine offsets and `qlx_prof`.
 
