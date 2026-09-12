@@ -22,7 +22,7 @@ COMMON_SOURCES = src/server/dllmain.c src/server/hooks.c src/server/commands.c \
                  src/server/misc.c src/server/maps_parser.c \
                  src/hook/simple_hook.c src/hook/trampoline.c src/hook/patches.c \
                  src/hook/protect.c \
-                 src/features/demos.c src/features/profile.c
+                 src/features/demos.c src/features/profile.c src/features/stream.c
 SOURCES_NOPY += $(COMMON_SOURCES)
 SOURCES += $(COMMON_SOURCES) \
            src/features/reliable.c src/features/scoreboard.c src/features/game_events.c \

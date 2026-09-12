@@ -946,6 +946,23 @@ def handle_demo_finished(client_id, path, size, discarded, failed):
         minqlxtended.log_exception()
         return True
 
+def handle_demo_stream(connected, endpoint, error):
+    """Called when the live demo stream's link to the relay comes up or goes down.
+
+    :param connected: True if the handshake just completed, False if the link just dropped.
+    :type connected: bool
+    :param endpoint: The relay being streamed to, as "host:port".
+    :type endpoint: str
+    :param error: Why the link dropped, or an empty string when it came up.
+    :type error: str
+
+    """
+    try:
+        return minqlxtended.EVENT_DISPATCHERS["demo_stream"].dispatch(connected, endpoint, error)
+    except:
+        minqlxtended.log_exception()
+        return True
+
 def handle_console_print(text):
     """Called whenever the server prints something to the console and when rcon is used."""
     try:
@@ -1034,6 +1051,7 @@ def register_handlers():
     minqlxtended.register_handler("kamikaze_explode", handle_kamikaze_explode)
 
     minqlxtended.register_handler("demo_finished", handle_demo_finished)
+    minqlxtended.register_handler("demo_stream", handle_demo_stream)
 
     minqlxtended.register_handler("player_death", handle_player_death)
     minqlxtended.register_handler("round_countdown", handle_round_countdown)

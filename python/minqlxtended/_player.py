@@ -818,6 +818,34 @@ class Player:
         return minqlxtended.stop_demo(self.id)
 
     @property
+    def stream_status(self) -> minqlxtended.StreamSlot | None:
+        """This player's live-streaming state as a ``StreamSlot``, or None if the slot is
+        past ``sv_maxclients``. A ``desynced`` point of view has lost blocks and starts again
+        at the next full snapshot. For the link itself see :func:`minqlxtended.stream_status`.
+        Game thread only, so marshal with :func:`minqlxtended.next_frame`."""
+        slots = minqlxtended.stream_status().slots
+        return slots[self.id] if self.id < len(slots) else None
+
+    def start_stream(self) -> bool:
+        """Streams this player's point of view, overriding ``sv_demoStream`` and
+        ``sv_demoStreamSlots``. A point of view can only begin at a gamestate, so a player
+        already in the game starts at their next one. A relay host must still be configured.
+        Game thread only, so marshal with :func:`minqlxtended.next_frame`.
+
+        :returns: bool -- True if blocks are already going out, False if it's only queued.
+        """
+        return minqlxtended.start_stream(self.id)
+
+    def stop_stream(self) -> bool:
+        """Closes this player's point of view and suppresses streaming for the slot until
+        they disconnect, even if ``sv_demoStream`` is on. Game thread only, so marshal with
+        :func:`minqlxtended.next_frame`.
+
+        :returns: bool -- True if a point of view was open.
+        """
+        return minqlxtended.stop_stream(self.id)
+
+    @property
     def is_alive(self) -> bool:
         return self._live_state.is_alive
 

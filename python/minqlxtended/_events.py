@@ -971,6 +971,16 @@ class DemoFinishedDispatcher(EventDispatcher):
         return super().dispatch(client_id, path, size, discarded, failed)
 
 
+class DemoStreamDispatcher(EventDispatcher):
+    """Event for the live demo stream's link to the relay coming up or going down. Fires once
+    per transition, and only if streaming is configured."""
+    name = "demo_stream"
+
+    @override
+    def dispatch(self, connected, endpoint, error):
+        return super().dispatch(connected, endpoint, error)
+
+
 EVENT_DISPATCHERS = EventDispatcherManager()
 EVENT_DISPATCHERS.add_dispatcher(ConsolePrintDispatcher)
 EVENT_DISPATCHERS.add_dispatcher(CommandDispatcher)
@@ -987,6 +997,7 @@ EVENT_DISPATCHERS.add_dispatcher(PlayerSpawnDispatcher)
 EVENT_DISPATCHERS.add_dispatcher(KamikazeUseDispatcher)
 EVENT_DISPATCHERS.add_dispatcher(KamikazeExplodeDispatcher)
 EVENT_DISPATCHERS.add_dispatcher(DemoFinishedDispatcher)
+EVENT_DISPATCHERS.add_dispatcher(DemoStreamDispatcher)
 EVENT_DISPATCHERS.add_dispatcher(StatsDispatcher)
 EVENT_DISPATCHERS.add_dispatcher(VoteCalledDispatcher)
 EVENT_DISPATCHERS.add_dispatcher(VoteStartedDispatcher)

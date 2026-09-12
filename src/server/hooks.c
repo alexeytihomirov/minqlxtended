@@ -39,6 +39,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "engine/quake_common.h"
 #include "features/reliable.h"
 #include "features/scoreboard.h"
+#include "features/stream.h"
 #include "hook/simple_hook.h"
 
 #ifndef NOPY
@@ -186,6 +187,7 @@ void __cdecl My_SV_DropClient(client_t* drop, const char* reason) {
 #endif
 
     Demo_ClientDisconnect(slot); // finalise this client's demo, if any
+    Stream_ClientDisconnect(slot);
 
     SV_DropClient(drop, reason);
 }
@@ -212,6 +214,7 @@ void __cdecl My_SV_SpawnServer(char* server, qboolean killBots) {
 #endif
 
     Demo_CloseAll(); // map change: finalise open demos; each client re-primes with a fresh gamestate
+    Stream_CloseAll();
 
 #ifndef NOPY
     GameEvents_Reset(); // the outgoing map's round, team and intermission state means nothing here
@@ -441,6 +444,14 @@ static void DispatchFinishedDemos(void) {
     }
 }
 
+// The stream thread holds no GIL, so it leaves the link state here for us to pick up.
+static void DispatchStreamState(void) {
+    stream_link_event_t link;
+    if (Stream_PollLinkChange(&link)) {
+        StreamStateDispatcher(link.connected, link.endpoint, link.error);
+    }
+}
+
 char* __cdecl My_ClientConnect(int clientNum, qboolean firstTime, qboolean isBot) {
     if (firstTime) {
         char* res = ClientConnectDispatcher(clientNum, isBot);
@@ -647,7 +658,13 @@ void __cdecl My_G_RunFrame(int time) {
         PROF_BEGIN(t_demos);
         DispatchFinishedDemos();
         PROF_END(PROF_DEMO_DISPATCH, t_demos);
+
+        DispatchStreamState();
 #endif
+
+        PROF_BEGIN(t_stream);
+        Stream_Frame();
+        PROF_END(PROF_STREAM_FRAME, t_stream);
     }
 
     G_RunFrame(time);
@@ -698,9 +715,12 @@ void __cdecl My_SV_Shutdown(char* finalmsg) {
 
     Demo_DrainFinalise();
 
+    Stream_DrainClose();
+
     // killserver keeps the process, so slot 3's override must not still be standing when the
     // next map seats someone else there. SV_Shutdown drops no clients of its own.
     Demo_ClearRequests();
+    Stream_ClearRequests();
 
 #ifndef NOPY
     // The drain has just produced a batch of completions and there will be no further frame

@@ -2102,6 +2102,12 @@ void __cdecl My_Touch_Item(gentity_t *ent, gentity_t *other, trace_t *trace);
 #define ENGINE_PRINTF Com_Printf
 #endif
 
+#ifndef NOPY
+#define ENGINE_CVAR_SET2 My_Cvar_Set2
+#else
+#define ENGINE_CVAR_SET2 Cvar_Set2
+#endif
+
 // Matches a server command's first word, so "cs" never matches "cstr".
 static inline qboolean cmd_word_is(const char* cmd, const char* word) {
     size_t n = strlen(word);
@@ -2141,6 +2147,7 @@ void __cdecl RegularPrint(void);         // "p"
 void __cdecl DownloadWorkshopItem(void); // "steam_downloadugcdefer"
 void __cdecl StopFollowing(void);        // "stopfollowing"
 void __cdecl ProfileCommand(void);       // "qlx_prof"
+void __cdecl StreamCommand(void);        // "qlx_stream"
 #ifndef NOPY
 void __cdecl ReliableCommand(void);   // "qlx_reliable"
 void __cdecl ScoreboardCommand(void); // "qlx_scoreboard"

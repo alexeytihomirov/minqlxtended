@@ -36,6 +36,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "engine/quake_common.h"
 #include "features/reliable.h"
 #include "features/scoreboard.h"
+#include "features/stream.h"
 
 // Registered from InitializeStatic, long before InitializeCvars and InitializeVm populate
 // sv_maxclients, g_entities and svs. A `stopfollowing 0` exec'd from a cfg before the first map
@@ -135,6 +136,26 @@ void __cdecl ProfileCommand(void) {
         ENGINE_PRINTF("Counters reset.\n");
     } else {
         ENGINE_PRINTF("Usage: %s [on|off|reset]\n", Cmd_Argv(0));
+    }
+}
+
+// Reports where the POVs are going and what the link has dropped. See stream.h.
+void __cdecl StreamCommand(void) {
+    const char* arg = Cmd_Argc() > 1 ? Cmd_Argv(1) : "";
+
+    if (!strcmp(arg, "reset")) {
+        Stream_Reset();
+        ENGINE_PRINTF("Counters reset.\n");
+    } else if (!strcmp(arg, "reconnect")) {
+        Stream_Reconnect();
+        ENGINE_PRINTF("Dropping the link; it will be dialled again straight away.\n");
+    } else if (!strcmp(arg, "resync")) {
+        Stream_ResyncAll();
+        ENGINE_PRINTF("Every open POV will send a full snapshot, one client per frame.\n");
+    } else if (arg[0]) {
+        ENGINE_PRINTF("Usage: %s [reset|reconnect|resync]\n", Cmd_Argv(0));
+    } else {
+        Stream_Report();
     }
 }
 

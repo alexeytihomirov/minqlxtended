@@ -213,6 +213,9 @@ SIGNATURES = {
     "stop_demo": "(client_id: int, /) -> bool",
     "demo_status": "(client_id: int, /) -> DemoStatus",
     "reliable_status": "() -> ReliableStatus",
+    "start_stream": "(client_id: int, /) -> bool",
+    "stop_stream": "(client_id: int, /) -> bool",
+    "stream_status": "() -> StreamStatus",
     "drop_item": "(client_id: int, item_id: int, angle: float = ..., /) -> int | None",
     "remove_entity": "(entity_id: int, /) -> bool",
     "spawn_entity": ("(classname: str, keys: dict[str, str | int | float | "

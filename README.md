@@ -66,7 +66,7 @@ Configuration
 =============
 minqlxtended is configured with cvars, like `qzeroded` itself, so `server.cfg` or `+set` on the command line both work. Everything has a default except `qlx_owner`, which must hold your SteamID64. The listed owner operates outside the permission system and can execute any command, raw Python included.
 
-The [Configuration](https://github.com/tjone270/minqlxtended/wiki/Configuration) wiki page lists every cvar: the core and database settings, logging, server-side demo recording, the reliable command guard and the team scoreboard trim. For plugin cvars see the [plugins repository](https://github.com/tjone270/minqlxtended-plugins).
+The [Configuration](https://github.com/tjone270/minqlxtended/wiki/Configuration) wiki page lists every cvar: the core and database settings, logging, server-side demo recording and streaming, the reliable command guard and the team scoreboard trim. For plugin cvars see the [plugins repository](https://github.com/tjone270/minqlxtended-plugins).
 
 What's new in v1.0.0
 ====================
@@ -76,7 +76,8 @@ What's new in v1.0.0
 - **Entities can be spawned, moved and removed** at runtime.
 - **The installed-map scan.** `installed_maps()`, `map_info()`, `factories()` and friends tell you what's installed and what gametypes each map declares.
 - **Server-side demo recording**, the reliable command guard and the team scoreboard trim, all described above.
-- **Two diagnostic console commands.** `qlx_prof` measures how much of the frame budget minqlxtended is using, and `qlx_pyperf` turns on CPython's perf trampoline so `perf` can name Python functions.
+- **Live demo streaming.** The same per-player blocks the recorder writes to `.dm_91` can go to a relay over TCP instead, so a custom client can watch any point of view live without taking a server slot. The reference relay in `tools/` takes any number of servers and files each one's POVs under its Steam account ID.
+- **Three diagnostic console commands.** `qlx_prof` measures how much of the frame budget minqlxtended is using, `qlx_stream` reports the state of the demo stream, and `qlx_pyperf` turns on CPython's perf trampoline so `perf` can name Python functions.
 
 The [wiki](https://github.com/tjone270/minqlxtended/wiki) covers all of it: [Writing Plugins](https://github.com/tjone270/minqlxtended/wiki/Writing-Plugins) and [Events](https://github.com/tjone270/minqlxtended/wiki/Events) to get started, [Engine Views](https://github.com/tjone270/minqlxtended/wiki/Engine-Views) for `level` and `Entity`, [Upgrading](https://github.com/tjone270/minqlxtended/wiki/Upgrading) to port an existing plugin, and [Internals](https://github.com/tjone270/minqlxtended/wiki/Internals) for the engine offsets and `qlx_prof`.
 
@@ -106,7 +107,7 @@ Four build targets, each with its own object directory:
 ```
 make              # bin/minqlxtended.x64.so, plus the Python package as bin/minqlxtended.zip
 make debug        # -O0 -g, and DEBUG defined
-make nopy         # no embedded interpreter; the hooks and the demo recorder only
+make nopy         # no embedded interpreter; the hooks, the demo recorder and the stream only
 make nopy_debug
 make clean
 ```
