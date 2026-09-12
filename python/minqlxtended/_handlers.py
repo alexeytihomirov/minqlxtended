@@ -66,6 +66,11 @@ def handle_console_command(cmd):
     """Console commands registered from Python via ``add_console_command()``, and the
     built-in ``pycmd``, are routed here and run as the owner, mirroring :func:`handle_rcon`.
 
+    ``add_console_command()`` names arrive with the name still in front, since
+    :meth:`CommandInvoker.handle_input` matches on the first word. ``pycmd`` arrives without
+    one: ``pycmd !balance`` reaches here as ``!balance``. See PyCommand and PyPrefixCommand
+    in ``quake_common.h``.
+
     """
     try:
         minqlxtended.COMMANDS.handle_input(minqlxtended.RconDummyPlayer(), cmd, minqlxtended.CONSOLE_CHANNEL)

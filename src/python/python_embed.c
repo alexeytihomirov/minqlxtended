@@ -2406,7 +2406,9 @@ static PyMethodDef minqlxtendedMethods[] = {
     {"force_vote", PyMinqlxtended_ForceVote, METH_VARARGS,
      "Forces the current vote to either fail or pass."},
     {"add_console_command", PyMinqlxtended_AddConsoleCommand, METH_VARARGS,
-     "Adds a console command that will be handled by Python code."},
+     "add_console_command(name) -- register a console command handled by Python.\n\n"
+     "The whole line goes to the command invoker, name first, so a Command registered under "
+     "the same name and reachable from the console channel is what runs."},
     {"register_handler", PyMinqlxtended_RegisterHandler, METH_VARARGS,
      "Register an event handler. Can be called more than once per event, but only the last one will work."},
     {"entities", (PyCFunction)(void (*)(void))PyMinqlxtended_Entities,

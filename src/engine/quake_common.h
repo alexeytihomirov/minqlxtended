@@ -2148,9 +2148,9 @@ void __cdecl PyPerfCommand(void);     // "qlx_pyperf"
 // PyRcon gives the owner the ability to execute pyminqlxtended commands as if the
 // owner executed them.
 void __cdecl PyRcon(void);
-// PyCommand is the handler for every console command added from Python. One handler for
-// all of them; it works out which one ran and redirects it.
+// One handler per shape of console command. See the notes on their definitions.
 void __cdecl PyCommand(void);
+void __cdecl PyPrefixCommand(void); // "pycmd"
 #endif
 
 #endif /* QUAKE_COMMON_H */

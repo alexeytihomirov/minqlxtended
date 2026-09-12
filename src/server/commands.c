@@ -200,7 +200,7 @@ void __cdecl PyRcon(void) {
     RconDispatcher(Cmd_Args());
 }
 
-void __cdecl PyCommand(void) {
+static void DispatchCustomCommand(const char* line) {
     if (!custom_command_handler) {
         return; // No registered handler.
     }
@@ -219,7 +219,7 @@ void __cdecl PyCommand(void) {
         return;
     }
 
-    PyObject* result = PyObject_CallFunction(handler, "s", Cmd_Args());
+    PyObject* result = PyObject_CallFunction(handler, "s", line);
     if (result == Py_False) {
         ENGINE_PRINTF("The command failed to be executed. pyminqlxtended found no handler.\n");
     }
@@ -228,6 +228,24 @@ void __cdecl PyCommand(void) {
     Py_DECREF(handler);
     PROF_END(PROF_CUSTOM_COMMAND, t_work);
     DispatcherRelease(gstate);
+}
+
+// "pycmd", whose argument is itself a minqlxtended command: `pycmd !balance` runs `!balance`.
+void __cdecl PyPrefixCommand(void) {
+    DispatchCustomCommand(Cmd_Args());
+}
+
+// Everything add_console_command() registered. CommandInvoker.handle_input matches on the first
+// word it is given, so the command's own name has to lead.
+void __cdecl PyCommand(void) {
+    char        line[MAX_STRING_CHARS];
+    const char* name = Cmd_Argv(0);
+    const char* args = Cmd_Args();
+
+    snprintf(line, sizeof(line), "%s%s%s", name ? name : "", (args && args[0]) ? " " : "",
+             args ? args : "");
+
+    DispatchCustomCommand(line);
 }
 
 #endif

@@ -478,7 +478,7 @@ void InitializeStatic(void) {
     Cmd_AddCommand("qlx_scoreboard", ScoreboardCommand);
     Cmd_AddCommand("qlx_pyperf", PyPerfCommand);
     Cmd_AddCommand("qlx", PyRcon);
-    Cmd_AddCommand("pycmd", PyCommand);
+    Cmd_AddCommand("pycmd", PyPrefixCommand);
 #endif
 
 #ifndef NOPY
