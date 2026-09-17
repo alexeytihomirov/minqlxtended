@@ -26,6 +26,12 @@ typedef struct {
     int pendingLive;
     int seenArm;
 
+    // First snapshot of the clock epoch being walked right now: its block
+    // sequence and its server time. Re-seeded at every backward clock jump, so
+    // when arm_ms is found these describe the epoch the arm instant lives in.
+    int epochSeq;
+    int epochMs;
+
     // Current block, set by the walker before each message so the snapshot
     // callback can stamp an index row with it.
     long long curOff;
@@ -134,7 +140,11 @@ static void dc_on_snapshot(dc_parser_t *p, const dc_snapshot_t *snap, void *user
     if (!st->haveFirst) {
         s->first_ms  = t;
         st->haveFirst = 1;
+        st->epochSeq  = st->curSeq;
+        st->epochMs   = t;
     } else if (t < s->last_ms) {
+        st->epochSeq = st->curSeq; // a new clock epoch starts on this snapshot
+        st->epochMs  = t;
         s->clock_resets++;
         // arm_ms already set means this backward jump sits inside
         // [arm_ms, ...] - the exact region a cut would be asked to select from.
@@ -153,7 +163,9 @@ static void dc_on_snapshot(dc_parser_t *p, const dc_snapshot_t *snap, void *user
     s->snapshot_count++;
 
     if (s->arm_ms < 0 && st->armSeq >= 0 && st->curSeq >= st->armSeq) {
-        s->arm_ms = t;
+        s->arm_ms            = t;
+        s->arm_epoch_seq     = st->epochSeq;
+        s->arm_epoch_firstms = st->epochMs;
     }
     if (st->pendingLive && s->live_ms < 0) {
         s->live_ms      = t;
@@ -185,6 +197,8 @@ static int dc_walk(const char *who, const char *in_path, int arm_seq, demo_scan_
     out->arm_ms                = -1;
     out->live_ms               = -1;
     out->live_seq              = -1;
+    out->arm_epoch_seq         = -1;
+    out->arm_epoch_firstms     = -1;
     out->client_num            = -1;
     out->clock_resets_since_arm  = (arm_seq >= 0) ? 0 : -1;
     out->clock_resets_since_live = (arm_seq >= 0) ? 0 : -1;

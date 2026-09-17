@@ -14,6 +14,10 @@
 // inside those captures and what to do with that:
 //   - arm/disarm a match on the engine's own state transitions (game_events.c
 //     calls the DemoMatch_OnGame*() entries below - no plugin involved);
+//   - bind only the clients who are actually IN the match: a spectator's capture
+//     is discarded rather than shipped, and a client who joins the game after the
+//     countdown is bound then, with their POV starting sv_demoCutJoinLead
+//     seconds before the join;
 //   - attribute each segment to a match_id and name the shipped file after the
 //     match rather than the wall clock;
 //   - run the two-stage cut + snapshot index over each finished segment on a

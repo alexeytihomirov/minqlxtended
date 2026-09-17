@@ -33,7 +33,10 @@
 // matches are inside those captures - match start and end are read off the
 // engine's own state by game_events.c, which calls the DemoMatch_OnGame*()
 // entry points below - and what upstream does not do with that knowledge:
-//   - attribute a segment to a match_id / map;
+//   - attribute a segment to a match_id / map - for the PLAYERS only: a
+//     spectator's capture is a camera follow, so it is neither packed into the
+//     match nor kept, while someone who joins the game mid-match gets a POV
+//     starting sv_demoCutJoinLead seconds before their join;
 //   - name the shipped file after that match instead of the wall clock;
 //   - the two-stage cut (countdown trim, then one shared server-time window
 //     across every POV of the match) and the per-POV snapshot index;
@@ -175,6 +178,14 @@ static cvar_t* sv_demoRecord;
 static cvar_t* fs_homepath;
 static cvar_t* mapname;
 static cvar_t* sv_demoCut;
+static cvar_t* sv_demoCutJoinLead;
+
+// Fallback when sv_demoCutJoinLead holds nonsense, and the ceiling that stops a
+// large value from reaching back into the warmup it is the point of this file to
+// trim off. 10 minutes is longer than any sane lead and shorter than a long
+// warmup, so a typo cannot silently turn a match POV back into a full capture.
+#define DEMO_JOIN_LEAD_DEFAULT_S 15
+#define DEMO_JOIN_LEAD_MAX_S     600
 
 // ---------------------------------------------------------------------------
 // Small helpers, ported unchanged from the pre-port demos.c body. They are
@@ -273,6 +284,7 @@ typedef struct {
     char match_id[64];
     time_t seed_at;     // wall time only: diagnostics/naming, never a cut time
     int32_t arm_seq;    // netchan outgoingSequence at the instant the match armed
+    int join_lead_ms;   // how far before arm_seq the window may open; 0 normally
     int slot;
     int last_for_match; // terminal marker: no file, just "this match is done"
     // sv_demoCut job: raw_path is the only field that matters (final_path and
@@ -1201,7 +1213,19 @@ static void demo_stage1(const demo_finalize_job_t* job) {
     // DEMO_CUT_TO_END/INT32_MAX all the same: with the opening edge pinned, the
     // closing one only has to stop at the real end of the data, and a concrete
     // bound keeps the cut from running on into anything a later epoch might add.
-    if (!demo_cut_into(job->raw_path, dir, scan.arm_ms, scan.last_ms, job->arm_seq, cut, sizeof(cut))) {
+    // Normally the window opens exactly at the arm instant. A mid-match joiner's
+    // does not: they were not in the countdown, so their POV starts
+    // sv_demoCutJoinLead ms before the moment they joined, clamped to the start
+    // of their own clock epoch (never further back than the data this epoch has).
+    int start_ms  = scan.arm_ms;
+    int start_seq = scan.arm_epoch_seq >= 0 ? scan.arm_epoch_seq : job->arm_seq;
+    if (job->join_lead_ms > 0) {
+        start_ms -= job->join_lead_ms;
+        if (scan.arm_epoch_firstms >= 0 && start_ms < scan.arm_epoch_firstms) {
+            start_ms = scan.arm_epoch_firstms;
+        }
+    }
+    if (!demo_cut_into(job->raw_path, dir, start_ms, scan.last_ms, start_seq, cut, sizeof(cut))) {
         demo_purge_dir(dir);
         DebugPrint("demo: slot %d stage 1 failed for %s; copying untrimmed\n", job->slot, job->raw_path);
         return;
@@ -1238,8 +1262,11 @@ static void demo_stage1(const demo_finalize_job_t* job) {
     // benefit.
     unlink(job->raw_path);
 
-    DebugPrint("demo: slot %d stage 1: arm_seq %d -> %d ms, kept [%d,%d] of [%d,%d]%s\n", job->slot,
-               job->arm_seq, scan.arm_ms, s1.first_ms, s1.last_ms, scan.first_ms, scan.last_ms,
+    DebugPrint("demo: slot %d stage 1: arm_seq %d -> %d ms, asked from %d ms%s, kept [%d,%d] of "
+               "[%d,%d]%s\n",
+               job->slot, job->arm_seq, scan.arm_ms, start_ms,
+               (job->join_lead_ms > 0) ? " (mid-match join lead)" : "", s1.first_ms, s1.last_ms,
+               scan.first_ms, scan.last_ms,
                (scan.live_ms >= 0) ? " (match went live inside the kept range)" : "");
 }
 
@@ -1441,6 +1468,15 @@ typedef struct {
     int32_t arm_seq; // netchan outgoingSequence at the arm instant, -1 if none
     int slot;
     int armed; // 1 once bound to a match_id
+    // Bound at a mid-match join rather than at the countdown, so its shipped POV
+    // starts sv_demoCutJoinLead seconds before arm_seq instead of at it.
+    int joined_late;
+    // A match was LIVE at some point while this segment was open. Only matters
+    // for a segment that never got armed: that combination is a spectator's
+    // camera follow of a real match, and sv_demoCut throws it away rather than
+    // trimming and keeping it. Without the flag it is indistinguishable from a
+    // capture whose match was cancelled, which is kept.
+    int saw_live;
     int used;
 } demo_seg_t;
 
@@ -1514,6 +1550,12 @@ static void demo_cvars_ensure(void) {
     if (!sv_demoCut) {
         sv_demoCut = Cvar_Get("sv_demoCut", "0", CVAR_ARCHIVE);
     }
+    // How many seconds before a mid-match join that client's shipped POV starts.
+    // Only ever consulted for a client who was NOT in the game at the countdown
+    // (see demo_seg_track); everyone who was starts at the countdown itself.
+    if (!sv_demoCutJoinLead) {
+        sv_demoCutJoinLead = Cvar_Get("sv_demoCutJoinLead", "15", CVAR_ARCHIVE);
+    }
 
     // Once per process, on the first call that can actually resolve the demo
     // directory: clear stage directories orphaned by a previous run. Deliberately
@@ -1547,6 +1589,54 @@ static int demo_cut_enabled(void) {
 
 static int demo_slot_connected(int slot) {
     return svs && svs->clients && svs->clients[slot].state >= CS_CONNECTED;
+}
+
+// How long a mid-match joiner's POV reaches back before their join, in ms.
+static int demo_join_lead_ms(void) {
+    demo_cvars_ensure();
+    int seconds = sv_demoCutJoinLead ? sv_demoCutJoinLead->integer : DEMO_JOIN_LEAD_DEFAULT_S;
+    if (seconds < 0) {
+        seconds = DEMO_JOIN_LEAD_DEFAULT_S;
+    }
+    if (seconds > DEMO_JOIN_LEAD_MAX_S) {
+        seconds = DEMO_JOIN_LEAD_MAX_S;
+    }
+    return seconds * 1000;
+}
+
+// Is this slot IN the game right now, as opposed to spectating it?
+//
+// The distinction is the whole reason a spectator does not get a match POV: with
+// sv_demoRecord set upstream records every connected client, and before this a
+// duel with two spectators shipped four POVs - two of them a camera follow, which
+// is dead weight in the .qlmatch and useless for analysis or restore.
+//
+// Read off the GAME module's own session team (the same field game_events.c's
+// CheckTeams polls), not off client_t: TEAM_SPECTATOR is a gameplay fact the
+// server-side client record does not carry. Every gametype agrees on it - duel
+// players are TEAM_FREE, team games RED/BLUE, and only a spectator is
+// TEAM_SPECTATOR - so no gametype special-casing is needed here.
+//
+// Returns 1 when the game module is not loaded (level/level->clients NULL during
+// a module reload, see common.h). That is deliberately the permissive answer: a
+// wrong "spectator" would DELETE a real player's capture, while a wrong "playing"
+// only ships a POV nobody wanted.
+static int demo_slot_playing(int slot) {
+    if (!level || !level->clients) {
+        return 1;
+    }
+    int maxclients = level->maxclients;
+    if (maxclients > MAX_DEMO_CLIENTS) {
+        maxclients = MAX_DEMO_CLIENTS;
+    }
+    if (slot < 0 || slot >= maxclients) {
+        return 1;
+    }
+    gclient_t* client = &level->clients[slot];
+    if (client->pers.connected != CON_CONNECTED) {
+        return 0;
+    }
+    return client->sess.sessionTeam != TEAM_SPECTATOR;
 }
 
 // The sequence the client's NEXT message will carry: Netchan_Transmit consumes
@@ -1624,6 +1714,40 @@ static void demo_seg_arm(demo_seg_t* s) {
 #ifndef NOPY
     DemoRecordingStartedDispatcher(s->slot, s->final_path, name);
 #endif
+}
+
+// Per-frame bookkeeping for the one segment a slot has open, whether it was just
+// opened or has been open for a while. Two jobs, both of which only mean anything
+// while a match is armed:
+//
+//   - Remember that a live match passed through this segment, so an unarmed one
+//     can be recognised as a spectator's follow-cam at completion time.
+//   - Bind a client who JOINS the game after the countdown. demo_arm_match only
+//     binds the players who were in the game when the match armed, so this is the
+//     only path a substitute coming off the bench gets a POV at all - and their
+//     POV cannot start at the countdown they were not in, so it starts
+//     sv_demoCutJoinLead seconds before the join instead.
+//
+// Deliberately NOT a team-change hook: the engine's own team plumbing has several
+// entry points (SetTeam, ExecuteTeamChange, admin puts, a spectator auto-joining
+// on a slot opening up) and a poll over the slots this loop already walks cannot
+// miss any of them. Cost is one field read per connected slot per frame.
+static void demo_seg_track(demo_seg_t* s) {
+    if (!g_armed) {
+        return;
+    }
+    if (g_live) {
+        s->saw_live = 1;
+    }
+    if (s->armed || !demo_slot_playing(s->slot)) {
+        return;
+    }
+    s->joined_late = 1;
+    demo_seg_arm(s);
+    if (s->armed) {
+        DebugPrint("demo: slot %d joined %s after it armed; its POV starts %d ms earlier\n", s->slot,
+                   g_match_id, demo_join_lead_ms());
+    }
 }
 
 // A new segment for this slot. Returns its index in g_seg, or -1 when the table
@@ -1832,12 +1956,13 @@ void DemoMatch_Frame(void) {
             }
             int idx = g_cur[slot];
             if (idx >= 0 && g_seg[idx].used && !strcmp(g_seg[idx].path, p)) {
-                continue; // same segment as last frame.
+                demo_seg_track(&g_seg[idx]); // same segment as last frame, but the player may have moved
+                continue;
             }
             idx         = demo_seg_open(slot, p);
             g_cur[slot] = idx;
             if (idx >= 0) {
-                demo_seg_arm(&g_seg[idx]); // no-op unless a match is armed right now
+                demo_seg_track(&g_seg[idx]); // no-op unless a match is armed right now
             }
         }
     }
@@ -1858,7 +1983,9 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
         g_cur[done->slot] = -1;
     }
 
-    int armed = s->armed;
+    int armed         = s->armed;
+    int spectated     = !s->armed && s->saw_live;
+    int join_lead_ms  = s->joined_late ? demo_join_lead_ms() : 0;
     char match_id[64];
     snprintf(match_id, sizeof(match_id), "%s", s->match_id);
 
@@ -1870,9 +1997,10 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
             snprintf(job->raw_path, sizeof(job->raw_path), "%s", done->path);
             snprintf(job->final_path, sizeof(job->final_path), "%s", s->final_path);
             snprintf(job->match_id, sizeof(job->match_id), "%s", s->match_id);
-            job->seed_at = s->seed_at;
-            job->arm_seq = s->arm_seq;
-            job->slot    = done->slot;
+            job->seed_at      = s->seed_at;
+            job->arm_seq      = s->arm_seq;
+            job->join_lead_ms = join_lead_ms;
+            job->slot         = done->slot;
             if (demo_finalize_push(job) != 0) {
                 DebugPrint("demo: finalize queue full, leaving %s in place\n", done->path);
                 free(job);
@@ -1881,6 +2009,19 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
     } else if (armed) {
         DebugPrint("demo: slot %d segment %s %s; nothing to cut for match %s\n", done->slot, done->path,
                    done->discarded ? "held only a gamestate" : "failed in the writer", match_id);
+    } else if (spectated && !done->discarded && !done->failed && demo_cut_enabled()) {
+        // A live match ran through this capture and its client never entered the
+        // game: a spectator's camera follow. Not trimmed and kept like the other
+        // unclaimed captures below - discarded, which is the whole point of not
+        // binding spectators in the first place. Done here rather than on the
+        // finalize thread because it needs no scan: the decision was already made
+        // while the segment was open.
+        if (unlink(done->path) == 0) {
+            DebugPrint("demo: sv_demoCut: slot %d spectated %s without playing; %s removed\n", done->slot,
+                       match_id[0] ? match_id : "a match", done->path);
+        } else {
+            DebugPrint("demo: sv_demoCut: could not remove spectator capture %s\n", done->path);
+        }
     } else if (!done->discarded && !done->failed && demo_cut_enabled()) {
         // Unclaimed by any match. sv_demoCut still owes it a trim: cut it down
         // to [went-live, end] if a match went live inside it (a capture from a
@@ -1975,6 +2116,7 @@ static void demo_cancel_match(void) {
         }
         s->armed         = 0;
         s->arm_seq       = -1;
+        s->joined_late   = 0; // the next arm decides this again from scratch
         s->match_id[0]   = '\0';
         s->final_path[0] = '\0';
         unbound++;
@@ -2009,11 +2151,16 @@ static void demo_arm_match(const char* match_id, const char* map) {
         return;
     }
 
-    // Bind everyone already being captured - which, under sv_demoRecord, is
-    // every connected client, each recorded since their own gamestate. No
-    // Demo_Request here: capture is the cvar's, this file only attributes it.
+    // Bind the PLAYERS already being captured. Under sv_demoRecord that capture
+    // covers every connected client, spectators included, but a spectator's POV
+    // is a camera follow: dead weight in the .qlmatch and useless for analysis,
+    // so it is not made part of the match (and sv_demoCut discards it at
+    // completion - see DemoMatch_OnFinished). Someone who joins the game later
+    // still gets a POV; demo_seg_track binds them when they do.
+    //
+    // No Demo_Request here: capture is the cvar's, this file only attributes it.
     for (int slot = 0; slot < MAX_DEMO_CLIENTS; slot++) {
-        if (!demo_slot_connected(slot)) {
+        if (!demo_slot_connected(slot) || !demo_slot_playing(slot)) {
             continue;
         }
         int idx = g_cur[slot];

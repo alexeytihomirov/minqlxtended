@@ -143,6 +143,24 @@ typedef struct demo_scan_s {
     // live_ms is -1.
     int live_seq;
 
+    // The clock epoch arm_ms lives in: the block sequence number and the server
+    // time of that epoch's FIRST snapshot. Both -1 when arm_ms is -1.
+    //
+    // This is the pair to hand demo_cut() when the window should open EARLIER
+    // than arm_ms - a caller wanting "from a few seconds before this instant"
+    // (demo_match.c's mid-match joiner) cannot pass arm_seq as start_seq,
+    // because that is precisely the point it needs to reach back past. Passing
+    // arm_epoch_seq instead still excludes every earlier clock epoch (which is
+    // all start_seq was ever protecting against) while leaving the time bound
+    // free to move anywhere inside this one. arm_epoch_firstms is how far back
+    // that can go: the epoch's own first snapshot, so a caller can clamp.
+    //
+    // For a window that starts exactly at arm_ms this pair is equivalent to
+    // arm_seq: server time is monotonic within one epoch, so the first message
+    // at/after arm_epoch_seq whose time is >= arm_ms IS the arm message.
+    int arm_epoch_seq;
+    int arm_epoch_firstms;
+
     // Number of gamestate messages in the whole file. 1 for anything the normal
     // capture path produces; anything else means first_ms/last_ms/arm_ms only
     // describe the leading gamestate and demo_cut() must not be used.

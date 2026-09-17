@@ -61,7 +61,8 @@ static void print_json(const char *path, const demo_scan_t *s, const demo_index_
     printf("{\"file\":\"%s\",\"arm_seq\":%d,", path, arm_seq);
     printf("\"first_ms\":%d,\"last_ms\":%d,\"arm_ms\":%d,\"live_ms\":%d,", s->first_ms, s->last_ms,
            s->arm_ms, s->live_ms);
-    printf("\"live_seq\":%d,", s->live_seq);
+    printf("\"live_seq\":%d,\"arm_epoch_seq\":%d,\"arm_epoch_firstms\":%d,", s->live_seq,
+           s->arm_epoch_seq, s->arm_epoch_firstms);
     printf("\"gamestate_count\":%d,\"clock_resets\":%d,\"clock_resets_since_arm\":%d,", s->gamestate_count,
            s->clock_resets, s->clock_resets_since_arm);
     printf("\"clock_resets_since_live\":%d,", s->clock_resets_since_live);
@@ -180,6 +181,7 @@ int main(int argc, char **argv) {
         printf("scan  arm_seq=%d -> arm_ms=%d (offset from first: %d ms), clock_resets_since_arm=%d\n",
                arm_seq, scan.arm_ms, (scan.arm_ms < 0) ? -1 : scan.arm_ms - scan.first_ms,
                scan.clock_resets_since_arm);
+        printf("scan  arm epoch starts at seq=%d, %d ms\n", scan.arm_epoch_seq, scan.arm_epoch_firstms);
         printf("scan  live_ms=%d live_seq=%d (cs %d warmup->live at/after arm), "
                "clock_resets_since_live=%d\n",
                scan.live_ms, scan.live_seq, DEMO_CS_WARMUP_INDEX, scan.clock_resets_since_live);
