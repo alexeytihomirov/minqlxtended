@@ -159,9 +159,10 @@ static void DrainFinishedDemos(void) {
         if (done.failed) {
             Demo_AbandonSlot(done.slot, done.gen);
         }
-        // Inert in a nopy build - nothing can arm a match without the Python
-        // bindings - but kept symmetrical with the pygame drain so the two
-        // never have to be reasoned about separately.
+        // Inert in a nopy build - GameEvents_Frame does not run there, so no
+        // match ever arms and no segment is tracked - but kept symmetrical
+        // with the pygame drain so the two never have to be reasoned about
+        // separately.
         DemoMatch_OnFinished(&done);
     }
 

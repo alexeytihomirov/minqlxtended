@@ -5,33 +5,33 @@
 
 // Per-match orchestration layered on top of upstream's own demos.c capture.
 //
-// Upstream records a slot for as long as demo_request[slot] > 0 (Demo_Request)
-// or sv_demoRecord is set, starting each segment at a gamestate and handing the
-// finished file back through Demo_PollFinished(). That is the whole capture
-// side; nothing in here touches a message, a FILE* or the writer thread.
+// Capture is sv_demoRecord's alone: with it set, upstream records every
+// connected client from their own gamestate and hands each finished file back
+// through Demo_PollFinished(). Nothing in here touches a message, a FILE* or
+// the writer thread, and nothing in here asks for a slot to be recorded.
 //
-// What this file adds is the *policy* and the *post-processing*:
-//   - arm/disarm a match, so segments can be attributed to a match_id;
-//   - name the shipped files after the match rather than after the wall clock;
-//   - run the two-stage UDT cut + snapshot index over each finished segment on
-//     a dedicated finalize thread;
+// What this file adds, all behind sv_demoCut, is knowing where the matches are
+// inside those captures and what to do with that:
+//   - arm/disarm a match on the engine's own state transitions (game_events.c
+//     calls the DemoMatch_OnGame*() entries below - no plugin involved);
+//   - attribute each segment to a match_id and name the shipped file after the
+//     match rather than the wall clock;
+//   - run the two-stage cut + snapshot index over each finished segment on a
+//     dedicated finalize thread, and trim (or delete) captures no match
+//     claimed;
 //   - fire demo_recording_started / demo_match_finalized into Python.
 //
 // EVERY function below is game-thread only, exactly like the Demo_* API it sits
 // on. See the threading note at the top of demo_match.c.
 
-// A client just connected. Arms upstream's capture for that slot so its
-// connect-time gamestate - the only point a valid .dm_91 can begin at - is
-// already inside a file by the time the match arms. Deliberately not gated on a
-// match being armed; the capture it starts is bounded instead by the unclaimed
-// deadline in demo_match.c (DEMO_UNARMED_TIMEOUT_S), which stops and deletes it
-// if no match ever claims it.
+// A client just connected. Pure bookkeeping: drops the previous occupant's
+// stale per-slot state. Capture for the new client is upstream's own doing.
 void DemoMatch_OnClientConnect(int slot);
 
 // Called once per game frame, before upstream's own completion drain, so a
 // segment opened during the last frame is noticed while its client is still
-// connected and its netchan sequence still readable. Also where the two
-// deadlines run: unclaimed captures, and matches still waiting on a segment.
+// connected and its netchan sequence still readable. Also where the match-close
+// deadline runs and post-match Demo_Request overrides are handed back.
 void DemoMatch_Frame(void);
 
 // One finished segment, handed straight from upstream's completion queue.
@@ -44,8 +44,13 @@ void DemoMatch_OnFinished(const demo_finished_t* done);
 // this only closes the match out so the files still get cut and indexed.
 void DemoMatch_OnCloseAll(void);
 
-// Bound to Python as minqlxtended.demo_arm()/demo_disarm().
-void DemoMatch_Arm(const char* match_id, const char* map);
-void DemoMatch_Disarm(void);
+// Match lifecycle, called by game_events.c off the engine-state crossings that
+// also fire the corresponding Python events. All no-ops unless sv_demoCut and
+// sv_demoRecord are both set (except OnGameEnd/OnCountdownCancelled, which
+// close out whatever an earlier call armed).
+void DemoMatch_OnGameCountdown(void);
+void DemoMatch_OnGameStart(void);
+void DemoMatch_OnGameEnd(void);
+void DemoMatch_OnCountdownCancelled(void);
 
 #endif /* DEMO_MATCH_H */

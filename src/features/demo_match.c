@@ -21,18 +21,23 @@
 //   Demo_CaptureBody()     -> if (!demo_slot_wanted(slot)) return;   // reads it
 //                             if (is_gamestate) { ...open a fresh segment... }
 //
-// so calling Demo_Request(slot, 1) at connect time, before the engine sends
-// that client's gamestate, makes upstream's own capture open a segment at
-// exactly that gamestate. That is byte-for-byte the outcome the prebuffer was
-// reconstructing by hand, produced by code that is already in the binary and
-// already maintained upstream. The prebuffer, the extra op-codes and our writer
-// thread are therefore gone, and demo_slot.c/.h with them.
+// and with sv_demoRecord set, upstream itself opens a segment at every
+// client's own gamestate, moments after they connect. That is byte-for-byte
+// the outcome the prebuffer was reconstructing by hand, produced by code that
+// is already in the binary and already maintained upstream. The prebuffer, the
+// extra op-codes and our writer thread are therefore gone, and demo_slot.c/.h
+// with them.
 //
-// What upstream does NOT do, and what is left here:
+// Capture is therefore entirely sv_demoRecord's: this file never asks for a
+// slot to be recorded. What it adds, under sv_demoCut, is knowing WHERE the
+// matches are inside those captures - match start and end are read off the
+// engine's own state by game_events.c, which calls the DemoMatch_OnGame*()
+// entry points below - and what upstream does not do with that knowledge:
 //   - attribute a segment to a match_id / map;
 //   - name the shipped file after that match instead of the wall clock;
 //   - the two-stage cut (countdown trim, then one shared server-time window
 //     across every POV of the match) and the per-POV snapshot index;
+//   - trim the pre-match warmup out of captures no match claimed;
 //   - the demo_recording_started / demo_match_finalized Python events.
 //
 // ---------------------------------------------------------------------------
@@ -59,11 +64,11 @@
 // raw one. Failure paths leave the raw capture in place, which is a valid demo
 // under an ordinary upstream name rather than a lost recording.
 //
-// A capture that no match ever claims is deleted rather than left there: see
-// DEMO_UNARMED_TIMEOUT_S. That is the ceiling the RAM prebuffer used to provide
-// for free (it lived under sv_demoPrebufMaxMB and was discarded when the match
-// never armed), and without it an opt-in feature would quietly fill an
-// operator's disk on any server where nothing arms a match.
+// A capture that no match ever claims - a client who connected and left during
+// warmup, an aborted countdown, a warmup-only session - is handed to the same
+// finalize thread as a trim-only job: cut down to [went-live, end] if a match
+// went live inside it, deleted if one never did. Both are what sv_demoCut asks
+// for; with it off, this file leaves every capture exactly as upstream wrote it.
 //
 // The shipped name is
 // "{match_id}_{map}_p{slot}_{name}_{seg_time}_{seg_id}.dm_91", so a consumer
@@ -152,7 +157,7 @@ extern serverStatic_t* svs; // defined in dllmain.c
 // demo_stage2_flush().
 #define DEMO_OUTLIER_WINDOW_MS 30000
 
-// How long (wall seconds) DemoMatch_Disarm waits for a match's still-open
+// How long (wall seconds) demo_disarm_match waits for a match's still-open
 // segments to come back through the completion queue before firing the
 // match-finalized marker anyway. A segment is closed by upstream on that
 // client's next outgoing message, so this is normally a frame or two; the
@@ -165,48 +170,10 @@ extern serverStatic_t* svs; // defined in dllmain.c
 // are still closing.
 #define DEMO_MAX_CLOSING 4
 
-// How long (wall seconds) a segment may stay open having NEVER been bound to a
-// match before this file stops capturing it and deletes what it captured.
-//
-// The connect-time Demo_Request(slot, 1) in DemoMatch_OnClientConnect is
-// deliberately not gated on a match being armed, and must not be: a .dm_91 has
-// to begin at a gamestate, a client's own gamestate is sent once, moments after
-// it connects, and a client that joins AFTER DemoMatch_Arm has already run for
-// the earlier players still has to be recorded from that gamestate. That is the
-// whole mechanism which replaced the RAM prebuffer.
-//
-// The price is that on a server where nothing ever arms a match - a warmup-only
-// session, an arming plugin that fails to load, players who connect and leave
-// between matches - every connection would otherwise produce a full-length
-// capture in sv_demoDir that is never cut, never published, never deleted and
-// invisible to the manifest's "{match_id}_*.dm_91" glob. The prebuffer could not
-// do that: it lived in RAM under sv_demoPrebufMaxMB and was simply dropped when
-// the match never armed. This deadline is the replacement for that ceiling, and
-// it is a ceiling in both directions - the segment stops growing AND the bytes
-// it already wrote go away (see DemoMatch_OnFinished), so the steady state on a
-// misconfigured server is at most one timeout-long capture per connection rather
-// than one unbounded capture per connection forever.
-//
-// 30 minutes is deliberately far longer than any gap this design cares about. A
-// segment is opened at connect and again at every map change, and a disarm
-// closes the armed ones, so on a working server the only unarmed segments in
-// existence are the ones between a client appearing and that match's countdown -
-// minutes, not tens of minutes. Anything still unclaimed half an hour later is
-// not "about to be armed", it is a capture nothing is ever going to want.
-//
-// Overridable at runtime with the qlx_nativeDemoUnarmedTimeout cvar (seconds);
-// 0 disables this cleanup entirely and restores the unbounded behaviour. The
-// cost when the deadline DOES fire on a client that would later have been armed
-// is that client's POV for that match: upstream's capture cannot resume until
-// their next gamestate (map change or reconnect), exactly the same constraint as
-// the KNOWN LIMITATION documented on DemoMatch_Disarm.
-#define DEMO_UNARMED_TIMEOUT_S 1800
-
 static cvar_t* sv_demoDir;
 static cvar_t* sv_demoRecord;
 static cvar_t* fs_homepath;
-static cvar_t* qlx_nativeDemoRecordEnabled;
-static cvar_t* qlx_nativeDemoUnarmedTimeout;
+static cvar_t* mapname;
 static cvar_t* sv_demoCut;
 
 // ---------------------------------------------------------------------------
@@ -1176,7 +1143,7 @@ static void demo_stage1(const demo_finalize_job_t* job) {
     }
     // A raw capture stays open and keeps accumulating across back-to-back
     // matches on the same map with no client reconnect (see the "known
-    // limitation" comment on DemoMatch_Disarm below), and a soft server
+    // limitation" comment on demo_disarm_match below), and a soft server
     // respawn between those matches resets the server clock without ever
     // sending a new gamestate - so scan.clock_resets (over the WHOLE file)
     // is routinely non-zero on a perfectly healthy capture: a stale, already-
@@ -1435,13 +1402,6 @@ typedef struct {
     int32_t arm_seq; // netchan outgoingSequence at the arm instant, -1 if none
     int slot;
     int armed; // 1 once bound to a match_id
-    // 1 when this segment exists because THIS file asked for it (the connect-time
-    // or arm-time Demo_Request), rather than because sv_demoRecord is on or
-    // because a plugin called upstream's own minqlxtended.demo_record(). Only an
-    // "ours" segment may be cancelled or deleted as unclaimed - see
-    // demo_unarmed_deadlines.
-    int ours;
-    int abandoned; // 1 once the unarmed deadline has given up on it
     int used;
 } demo_seg_t;
 
@@ -1449,12 +1409,22 @@ static demo_seg_t g_seg[DEMO_MAX_PENDING];
 static int g_cur[MAX_DEMO_CLIENTS]; // index into g_seg, or -1
 static int g_cur_init;
 
-// Per slot: "the request that is currently keeping this slot recording is ours".
-// Set where this file calls Demo_Request(slot, 1), cleared when it gives up on
-// the slot, and copied into each segment as it opens.
-static int g_our_request[MAX_DEMO_CLIENTS];
+// Per slot: this file put a Demo_Request(slot, -1) in to close the match's
+// segment at game_end, and owes upstream a reset to 0 ("follow sv_demoRecord")
+// once that close has landed. Without the reset the override would outlive the
+// match and suppress this client's next-map capture; with an immediate reset
+// the close itself would never happen, because the very next message would see
+// sv_demoRecord set and keep the file open. DemoMatch_Frame pays the debt as
+// soon as the slot stops recording; a disconnect clears it for free (upstream
+// resets the override in Demo_ClientDisconnect).
+static int g_close_pending[MAX_DEMO_CLIENTS];
 
 static int g_armed;
+// The armed match has been seen live (game_start). A match that ends was
+// always live first, so this only gates the abort path: a countdown that
+// falls apart cancels the arm as if it never happened, rather than
+// finalising a "match" nothing was played in.
+static int g_live;
 static char g_match_id[64];
 static char g_map[64];
 static uint32_t g_seg_seq; // ever-increasing per-segment discriminator
@@ -1494,29 +1464,21 @@ static void demo_cvars_ensure(void) {
     if (!sv_demoRecord) {
         sv_demoRecord = Cvar_FindVar("sv_demoRecord");
     }
-    // Registered by the Python addon (set_cvar_once), so it does not exist until
-    // that plugin has loaded - look it up every time until it turns up rather
-    // than caching a NULL forever. Same for the timeout below, which has no
-    // registration at all: it only exists once an operator puts a `set` for it in
-    // a config, and until then the compiled-in default stands.
-    if (!qlx_nativeDemoRecordEnabled) {
-        qlx_nativeDemoRecordEnabled = Cvar_FindVar("qlx_nativeDemoRecordEnabled");
+    if (!mapname) {
+        mapname = Cvar_FindVar("mapname");
     }
-    if (!qlx_nativeDemoUnarmedTimeout) {
-        qlx_nativeDemoUnarmedTimeout = Cvar_FindVar("qlx_nativeDemoUnarmedTimeout");
-    }
-    // Ours to register, unlike the two above: this is a plain sv_-family demo
-    // knob (like sv_demoRecord/sv_demoDir, which demos.c owns), not something a
-    // Python addon or an operator config line introduces on its own. demos.c
-    // itself stays untouched upstream code (see the comment above
-    // demo_sanitise), so it is registered from here instead.
+    // Ours to register: this is a plain sv_-family demo knob (like
+    // sv_demoRecord/sv_demoDir, which demos.c owns), not something an operator
+    // config line introduces on its own. demos.c itself stays untouched
+    // upstream code (see the comment above demo_sanitise), so it is registered
+    // from here instead.
     if (!sv_demoCut) {
         sv_demoCut = Cvar_Get("sv_demoCut", "0", CVAR_ARCHIVE);
     }
 
     // Once per process, on the first call that can actually resolve the demo
     // directory: clear stage directories orphaned by a previous run. Deliberately
-    // NOT gated on qlx_nativeDemoRecordEnabled - an operator who turned the
+    // NOT gated on sv_demoCut - an operator who turned the
     // feature off after a crash still wants the leftovers gone. Same placement as
     // upstream's own .part sweep in Demo_Init(), and cheap for the same reason:
     // one bounded directory walk, on the game thread, at startup.
@@ -1527,41 +1489,18 @@ static void demo_cvars_ensure(void) {
     }
 }
 
-static int demo_match_enabled(void) {
-    demo_cvars_ensure();
-    return qlx_nativeDemoRecordEnabled && qlx_nativeDemoRecordEnabled->integer != 0;
-}
-
-// See DEMO_UNARMED_TIMEOUT_S. Both callers test for "> 0", so any value at or
-// below zero - including a nonsense negative one - disables the cleanup rather
-// than expiring every capture the instant it opens.
-static int demo_unarmed_timeout_s(void) {
-    demo_cvars_ensure();
-    if (!qlx_nativeDemoUnarmedTimeout) {
-        return DEMO_UNARMED_TIMEOUT_S;
-    }
-    return qlx_nativeDemoUnarmedTimeout->integer;
-}
-
-// True when upstream would be capturing every slot with or without us. Then a
-// capture on disk is the operator's, produced by upstream's own always-record
-// feature, and this file must neither cancel it (Demo_Request(-1) overrides the
-// cvar) nor delete it: "record everyone, for as long as they are connected" is
-// exactly what sv_demoRecord means, so there is no ceiling to restore and
-// nothing here is entitled to the file.
+// Capture is upstream's alone: this file only ever attributes and post-
+// processes what sv_demoRecord already writes. When the cvar is off there is
+// nothing to attribute, so the match machinery stays idle too.
 static int demo_upstream_records(void) {
     demo_cvars_ensure();
     return sv_demoRecord && sv_demoRecord->integer != 0;
 }
 
-// sv_demoCut: trim the pre-match warmup out of a finished capture that no match
-// ever armed, instead of the two outcomes it would otherwise get (deleted once
-// qlx_nativeDemoUnarmedTimeout expires, or kept full-length forever under
-// sv_demoRecord=1). Deliberately independent of qlx_nativeDemoRecordEnabled and
-// of the arm/disarm machinery entirely: this applies to every capture
-// DemoMatch_Frame tracks, including ones that exist purely because sv_demoRecord
-// is set with no match-arming plugin in the picture at all - that server is
-// exactly who asked for this cvar.
+// sv_demoCut: everything this file does is behind it. On, a capture bound to a
+// match ships as the match-named two-stage cut, and a capture no match claimed
+// is trimmed down to [went-live, end] (or deleted when no match ever went live
+// inside it). Off, every capture stays exactly as upstream wrote it.
 static int demo_cut_enabled(void) {
     demo_cvars_ensure();
     return sv_demoCut && sv_demoCut->integer != 0;
@@ -1635,12 +1574,9 @@ static void demo_seg_arm(demo_seg_t* s) {
     demo_seg_build_final(s, name);
     if (!s->final_path[0]) {
         DebugPrint("demo: slot %d has no fs_homepath; segment %s will not be published\n", s->slot, s->path);
-        s->match_id[0] = '\0';
         // Never bound to a match and never will be (demo_seg_arm is not
-        // retried) - disown it so the unarmed-deadline sweep leaves this
-        // capture on disk under its own name instead of deleting a match
-        // POV it never had the chance to publish.
-        s->ours = 0;
+        // retried) - its completion takes the ordinary unclaimed path instead.
+        s->match_id[0] = '\0';
         return;
     }
     s->armed = 1;
@@ -1673,8 +1609,7 @@ static int demo_seg_open(int slot, const char* path) {
     // (src/server/dllmain.c) - unrated this is dozens of lines per second, per
     // affected slot, indefinitely. "The table is full" is a standing condition
     // someone should look at, not news that needs sub-second freshness, so rate
-    // limit it the same way demo_unarmed_deadlines' `static int said` does for its
-    // own standing condition.
+    // limit it: a standing condition earns one line a minute, not one a frame.
     static time_t full_logged_at;
     time_t now = time(NULL);
     if (now - full_logged_at >= DEMO_SEG_FULL_LOG_INTERVAL_S) {
@@ -1784,70 +1719,22 @@ static void demo_closing_deadlines(void) {
     }
 }
 
-// Next wall second this file will walk g_seg looking for unclaimed segments.
-// demo_closing_deadlines can scan its 4 entries every frame; this one walks 128
-// records of ~1 KB each, which is not worth doing 40 times a second for a
-// deadline measured in minutes.
-static time_t g_unarmed_sweep_at;
+// ---------------------------------------------------------------------------
+// Match lifecycle. Driven by game_events.c's own polling of the engine state
+// (the same crossings that fire game_countdown / game_start / game_end into
+// Python), so no plugin is involved: with sv_demoRecord and sv_demoCut both
+// set, matches are found, cut and finalised by this file alone.
+// ---------------------------------------------------------------------------
 
-// A segment nothing is ever going to claim. Distinct from demo_closing_deadlines
-// above, which backstops the opposite case (a match that WAS armed and whose
-// segments have not all come back yet): that one waits seconds on a segment with
-// a match behind it, this one waits minutes on a segment with no match at all.
-// See DEMO_UNARMED_TIMEOUT_S for why the connect-time capture cannot simply be
-// gated on a match being armed instead.
-static void demo_unarmed_deadlines(void) {
+// The moment a match arms is the moment its identity is fixed: the same UTC
+// stamp convention a consumer globs for ("{match_id}_*.dm_91", see the naming
+// note at the top), deliberately distinct from sv_demoNameFormat's default
+// "%Y%m%d-%H%M%S" raw names.
+static void demo_match_id_now(char* out, size_t n) {
     time_t now = time(NULL);
-    if (now < g_unarmed_sweep_at) {
-        return;
-    }
-    g_unarmed_sweep_at = now + 1;
-
-    int timeout = demo_unarmed_timeout_s();
-    if (timeout <= 0) {
-        return; // operator opted out; see demo_unarmed_timeout_s.
-    }
-    if (demo_upstream_records()) {
-        static int said;
-        if (!said) {
-            said = 1;
-            DebugPrint("demo: sv_demoRecord is set, so every slot is captured with or without a "
-                       "match; never-armed captures are the operator's and are left in place\n");
-        }
-        return;
-    }
-
-    for (int i = 0; i < DEMO_MAX_PENDING; i++) {
-        demo_seg_t* s = &g_seg[i];
-        if (!s->used || s->armed || !s->ours || s->abandoned) {
-            continue;
-        }
-        if (now - s->seed_at < timeout) {
-            continue;
-        }
-        // Marked before the request, and the record is deliberately NOT freed
-        // here: its completion is what deletes the file (see
-        // DemoMatch_OnFinished), so it has to stay findable by demo_seg_find
-        // until then. The flag is what stops this firing again every second on a
-        // segment whose completion is slow - or never comes at all, in which case
-        // upstream is no longer capturing it and the record is inert.
-        s->abandoned = 1;
-        if (g_cur[s->slot] >= 0 && &g_seg[g_cur[s->slot]] == s) {
-            // -1, not 0, for the same reason as DemoMatch_Disarm's: 0 means
-            // "follow sv_demoRecord", which is checked above but could be set in
-            // the meantime. Upstream closes the segment on this client's next
-            // outgoing message and resets the override on disconnect.
-            Demo_Request(s->slot, -1);
-        }
-        // Stop claiming the slot. A later minqlxtended.demo_record() from a
-        // plugin would open a segment that is upstream's, not ours to cancel or
-        // delete; DemoMatch_Arm/OnClientConnect set this again when this file
-        // asks for the slot itself.
-        g_our_request[s->slot] = 0;
-        DebugPrint("demo: slot %d capture %s has been open %d s with no match to claim it; "
-                   "stopping it and dropping what it captured (timeout %d s)\n",
-                   s->slot, s->path, (int)(now - s->seed_at), timeout);
-    }
+    struct tm tm;
+    gmtime_r(&now, &tm);
+    strftime(out, n, "%Y%m%dT%H%M%SZ", &tm);
 }
 
 // ---------------------------------------------------------------------------
@@ -1862,20 +1749,13 @@ void DemoMatch_OnClientConnect(int slot) {
     // Whatever the previous occupant of this slot had open is already closed
     // (Demo_ClientDisconnect) and stays in the pending table under its own path
     // until its completion arrives - only the "currently open" pointer and the
-    // ownership flag are stale, and both belong to that occupant, not this one.
-    g_cur[slot]         = -1;
-    g_our_request[slot] = 0;
-    // Deliberately NOT gated on a match being armed. The gamestate this call is
-    // racing ahead of is the ONLY point a valid .dm_91 for this connection can
-    // begin at, and it is sent once, moments from now. Miss it and this client
-    // cannot be recorded for any match until they reconnect or the map changes.
-    // What keeps that from filling the disk when no match ever arms is the
-    // deadline in demo_unarmed_deadlines, not a narrower request here.
-    if (!g_armed && !demo_match_enabled()) {
-        return;
-    }
-    Demo_Request(slot, 1);
-    g_our_request[slot] = 1;
+    // close debt are stale, and both belong to that occupant, not this one
+    // (upstream reset the request override itself on their disconnect).
+    g_cur[slot]           = -1;
+    g_close_pending[slot] = 0;
+    // Nothing to request: with sv_demoRecord set, upstream opens this client's
+    // segment at their gamestate on its own, and without it there is nothing
+    // for this file to attribute.
 }
 
 void DemoMatch_Frame(void) {
@@ -1885,6 +1765,14 @@ void DemoMatch_Frame(void) {
             const char* p = Demo_IsRecording(slot) ? Demo_GetPath(slot) : NULL;
             if (!p) {
                 g_cur[slot] = -1; // closed; its completion carries its own path.
+                if (g_close_pending[slot]) {
+                    // The game_end close has landed; hand the slot back to
+                    // sv_demoRecord so its next gamestate opens a fresh
+                    // upstream segment. See g_close_pending for why this
+                    // cannot happen at the moment the -1 goes in.
+                    g_close_pending[slot] = 0;
+                    Demo_Request(slot, 0);
+                }
                 continue;
             }
             int idx = g_cur[slot];
@@ -1894,14 +1782,10 @@ void DemoMatch_Frame(void) {
             idx         = demo_seg_open(slot, p);
             g_cur[slot] = idx;
             if (idx >= 0) {
-                // Recorded at open: only a segment this file asked for may later
-                // be cancelled and deleted as unclaimed.
-                g_seg[idx].ours = g_our_request[slot];
                 demo_seg_arm(&g_seg[idx]); // no-op unless a match is armed right now
             }
         }
     }
-    demo_unarmed_deadlines();
     demo_closing_deadlines();
 }
 
@@ -1919,9 +1803,7 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
         g_cur[done->slot] = -1;
     }
 
-    int armed     = s->armed;
-    int ours      = s->ours;
-    int abandoned = s->abandoned;
+    int armed = s->armed;
     char match_id[64];
     snprintf(match_id, sizeof(match_id), "%s", s->match_id);
 
@@ -1945,13 +1827,11 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
         DebugPrint("demo: slot %d segment %s %s; nothing to cut for match %s\n", done->slot, done->path,
                    done->discarded ? "held only a gamestate" : "failed in the writer", match_id);
     } else if (!done->discarded && !done->failed && demo_cut_enabled()) {
-        // sv_demoCut=1: trim this capture instead of either fate below - not
-        // gated on `ours`/demo_upstream_records()/demo_unarmed_timeout_s() at
-        // all, because those three exist to decide whether an unclaimed capture
-        // is worth deleting, and this cvar's whole point is that it no longer
-        // is: cut it down to the match instead. Applies equally to a segment
-        // that exists only because sv_demoRecord=1 keeps everyone recorded
-        // forever - the case the branch below can never touch.
+        // Unclaimed by any match. sv_demoCut still owes it a trim: cut it down
+        // to [went-live, end] if a match went live inside it (a capture from a
+        // cancelled arm, or one that outlived its match's close), delete it if
+        // one never did (a warmup-only connection). Both are the finalize
+        // thread's call - it is the one that can afford the scan.
         demo_finalize_job_t* job = (demo_finalize_job_t*)calloc(1, sizeof(*job));
         if (!job) {
             DebugPrint("demo: out of memory trimming %s\n", done->path);
@@ -1966,26 +1846,6 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
                 free(job);
             }
         }
-    } else if (ours && !done->discarded && !demo_upstream_records() && demo_unarmed_timeout_s() > 0) {
-        // Never bound to a match, and it only existed because this file asked for
-        // it at connect time. It cannot become a POV of anything now - the record
-        // is cleared below and no match ever claimed it - so what is on disk is a
-        // full-length capture that would sit in sv_demoDir forever, never cut,
-        // never published and invisible to the manifest's "{match_id}_*.dm_91"
-        // glob. Unlike the failed-cut case in the finalize thread, which leaves
-        // its raw capture behind precisely because a match DID want it, there is
-        // nothing here to recover, and this is a steady-state outcome rather than
-        // a rare failure: on a server where nothing arms a match it happens on
-        // every single connect. Delete it.
-        //
-        // discarded means upstream already unlinked it. A failed segment's path
-        // is the ".part", which is the same unclaimable bytes under a different
-        // name, so it goes too - upstream has already logged the write error that
-        // produced it.
-        if (unlink(done->path) == 0) {
-            DebugPrint("demo: slot %d capture %s belonged to no match%s; removed (%ld bytes)\n", done->slot,
-                       done->path, abandoned ? ", deadline expired" : "", done->bytes);
-        }
     }
 
     memset(s, 0, sizeof(*s));
@@ -1995,49 +1855,13 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
     }
 }
 
-void DemoMatch_Arm(const char* match_id, const char* map) {
-    demo_cur_init();
-    if (g_armed) {
-        DemoMatch_Disarm(); // re-arm without a disarm: close the previous match out first.
-    }
-    demo_cvars_ensure();
-    demo_sanitise(g_match_id, sizeof(g_match_id), match_id);
-    demo_sanitise(g_map, sizeof(g_map), map);
-    demo_finalize_ensure();
-    g_armed = 1;
-
-    if (!svs || !svs->clients) {
-        DebugPrint("demo: armed %s on %s (engine not ready; slots bind as they open)\n", g_match_id, g_map);
-        return;
-    }
-
-    for (int slot = 0; slot < MAX_DEMO_CLIENTS; slot++) {
-        if (!demo_slot_connected(slot)) {
-            continue;
-        }
-        // Both halves matter. The request covers a client whose segment is not
-        // open yet (they connected before this feature was enabled, and will
-        // only start recording at their next gamestate - see the known
-        // limitation on DemoMatch_Disarm). The bind covers everyone already
-        // being captured since their own connect, which is the normal case and
-        // the one the connect-time arm exists to produce.
-        Demo_Request(slot, 1);
-        g_our_request[slot] = 1;
-        int idx             = g_cur[slot];
-        if (idx >= 0 && g_seg[idx].used) {
-            demo_seg_arm(&g_seg[idx]);
-        }
-    }
-    DebugPrint("demo: armed %s on %s\n", g_match_id, g_map);
-}
-
 // KNOWN LIMITATION, carried forward unchanged from before the v1.0.0 port:
 // back-to-back matches on the same map, with no intervening reconnect or map
 // load, do not produce a fresh gamestate, so the second match records nothing
 // for the players who were already there. This is inherent to the demo format
 // (a valid .dm_91 must start at a gamestate), not a property of this design -
 // the pre-port version had exactly the same hole, for exactly the same reason.
-void DemoMatch_Disarm(void) {
+static void demo_disarm_match(void) {
     demo_cur_init();
     if (!g_armed) {
         return;
@@ -2046,6 +1870,7 @@ void DemoMatch_Disarm(void) {
     snprintf(match_id, sizeof(match_id), "%s", g_match_id);
 
     g_armed       = 0;
+    g_live        = 0;
     g_match_id[0] = '\0';
     g_map[0]      = '\0';
 
@@ -2059,13 +1884,14 @@ void DemoMatch_Disarm(void) {
         }
         outstanding++;
         if (g_cur[s->slot] >= 0 && &g_seg[g_cur[s->slot]] == s) {
-            // -1, not 0: 0 means "follow sv_demoRecord", which on a server that
-            // has it set would leave the segment open past the end of the match,
-            // and its file would then never be cut, indexed or packed. -1 closes
-            // it on this client's next outgoing message, which is this frame or
-            // the next. Upstream resets the override to 0 on disconnect, so this
-            // never outlives the connection.
+            // -1, not 0: 0 means "follow sv_demoRecord", which is set on any
+            // server this machinery runs on and would leave the segment open
+            // past the end of the match, so its file would never be cut,
+            // indexed or packed. -1 closes it on this client's next outgoing
+            // message, which is this frame or the next; DemoMatch_Frame then
+            // owes upstream the reset back to 0 - see g_close_pending.
             Demo_Request(s->slot, -1);
+            g_close_pending[s->slot] = 1;
         }
     }
 
@@ -2076,9 +1902,133 @@ void DemoMatch_Disarm(void) {
     DebugPrint("demo: disarmed %s, %d segment(s) still closing\n", match_id, outstanding);
 }
 
+// The arm never happened: unbind every segment it claimed and forget the match.
+// For a countdown that fell apart before the match went live - there is nothing
+// to finalise, no marker to send and no event to fire, and the captures keep
+// recording under sv_demoRecord exactly as if the countdown had never started
+// (their completions take the unclaimed-trim path in DemoMatch_OnFinished).
+static void demo_cancel_match(void) {
+    demo_cur_init();
+    if (!g_armed) {
+        return;
+    }
+    int unbound = 0;
+    for (int i = 0; i < DEMO_MAX_PENDING; i++) {
+        demo_seg_t* s = &g_seg[i];
+        if (!s->used || !s->armed || strcmp(s->match_id, g_match_id) != 0) {
+            continue;
+        }
+        s->armed         = 0;
+        s->arm_seq       = -1;
+        s->match_id[0]   = '\0';
+        s->final_path[0] = '\0';
+        unbound++;
+    }
+    DebugPrint("demo: match %s cancelled before going live; %d segment(s) unbound\n", g_match_id, unbound);
+    g_armed       = 0;
+    g_live        = 0;
+    g_match_id[0] = '\0';
+    g_map[0]      = '\0';
+}
+
+static void demo_arm_match(const char* match_id, const char* map) {
+    demo_cur_init();
+    if (g_armed) {
+        // Re-arm without an end in between: close a live match out first; an
+        // arm that never went live never happened.
+        if (g_live) {
+            demo_disarm_match();
+        } else {
+            demo_cancel_match();
+        }
+    }
+    demo_cvars_ensure();
+    demo_sanitise(g_match_id, sizeof(g_match_id), match_id);
+    demo_sanitise(g_map, sizeof(g_map), map);
+    demo_finalize_ensure();
+    g_armed = 1;
+    g_live  = 0;
+
+    if (!svs || !svs->clients) {
+        DebugPrint("demo: armed %s on %s (engine not ready; slots bind as they open)\n", g_match_id, g_map);
+        return;
+    }
+
+    // Bind everyone already being captured - which, under sv_demoRecord, is
+    // every connected client, each recorded since their own gamestate. No
+    // Demo_Request here: capture is the cvar's, this file only attributes it.
+    for (int slot = 0; slot < MAX_DEMO_CLIENTS; slot++) {
+        if (!demo_slot_connected(slot)) {
+            continue;
+        }
+        int idx = g_cur[slot];
+        if (idx >= 0 && g_seg[idx].used) {
+            demo_seg_arm(&g_seg[idx]);
+        }
+    }
+    DebugPrint("demo: armed %s on %s\n", g_match_id, g_map);
+}
+
+// The countdown is the moment the match's identity is fixed and its segments
+// bind - the shipped files start here (stage 1 cuts at the arm instant).
+void DemoMatch_OnGameCountdown(void) {
+    if (!demo_cut_enabled() || !demo_upstream_records()) {
+        return;
+    }
+    char match_id[64];
+    demo_match_id_now(match_id, sizeof(match_id));
+    demo_cvars_ensure();
+    const char* map = (mapname && mapname->string[0]) ? mapname->string : "unknown";
+    demo_arm_match(match_id, map);
+}
+
+// The armed match went live. Also the late-arm fallback: a game that reaches
+// live without this file having armed at its countdown (sv_demoCut flipped on
+// mid-countdown, or a start with no countdown at all) is still worth cutting -
+// from here instead of the countdown, which is all the information there is.
+void DemoMatch_OnGameStart(void) {
+    if (g_armed) {
+        g_live = 1;
+        return;
+    }
+    if (!demo_cut_enabled() || !demo_upstream_records()) {
+        return;
+    }
+    char match_id[64];
+    demo_match_id_now(match_id, sizeof(match_id));
+    demo_cvars_ensure();
+    const char* map = (mapname && mapname->string[0]) ? mapname->string : "unknown";
+    demo_arm_match(match_id, map);
+    g_live = 1;
+}
+
+// Both engine paths to a match ending land here: intermission queued, and a
+// live game abandoned back to warmup (forfeit, admin stop).
+void DemoMatch_OnGameEnd(void) {
+    if (!g_armed) {
+        return;
+    }
+    demo_disarm_match();
+}
+
+// A countdown that fell apart (player left, ready state lost) before the match
+// went live. Nothing was played, so the arm is taken back rather than
+// finalised - without this, the next real match's arm would flush a "match"
+// consisting of warmup.
+void DemoMatch_OnCountdownCancelled(void) {
+    if (g_armed && !g_live) {
+        demo_cancel_match();
+    }
+}
+
 void DemoMatch_OnCloseAll(void) {
     // Upstream's Demo_CloseAll() finalises every open segment, so their
     // completions are on their way; all this has to do is stop the match from
-    // waiting for anything else.
-    DemoMatch_Disarm();
+    // waiting for anything else. A match that never went live (a map change
+    // voted mid-countdown) is cancelled, not finalised.
+    if (g_armed && !g_live) {
+        demo_cancel_match();
+        return;
+    }
+    demo_disarm_match();
 }

@@ -27,7 +27,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <structseq.h>
 
 #include "common.h"
-#include "features/demo_match.h"
 #include "engine/quake_common.h"
 #include "features/console_command.h"
 #include "features/demos.h"
@@ -729,29 +728,6 @@ static PyObject* PyMinqlxtended_PlayersInfo(PyObject* self, PyObject* args) {
     }
 
     return ret;
-}
-
-// demo_arm
-
-static PyObject* PyMinqlxtended_DemoArm(PyObject* self, PyObject* args) {
-    const char* match_id;
-    const char* map_name;
-
-    if (!PyArg_ParseTuple(args, "ss:demo_arm", &match_id, &map_name)) {
-        return NULL;
-    }
-
-    DemoMatch_Arm(match_id, map_name);
-    Py_RETURN_NONE;
-}
-
-// demo_disarm
-
-static PyObject* PyMinqlxtended_DemoDisarm(PyObject* self, PyObject* args) {
-    (void)self;
-    (void)args;
-    DemoMatch_Disarm();
-    Py_RETURN_NONE;
 }
 
 // get_userinfo
@@ -2796,10 +2772,6 @@ static PyMethodDef minqlxtendedMethods[] = {
      "does.\n\n"
      "Unlinked entities stop colliding and stop being sent to clients; r.linked reads "
      "back False. Game thread only."},
-    {"demo_arm", PyMinqlxtended_DemoArm, METH_VARARGS,
-     "Arms native per-player demo recording for the current match (match_id, map_name)."},
-    {"demo_disarm", PyMinqlxtended_DemoDisarm, METH_NOARGS,
-     "Disarms native per-player demo recording, closing and finalising every open file."},
     {"set_position", PyMinqlxtended_SetPosition, METH_VARARGS,
      "set_position(client_id, position) -- atomically writes ps.origin, "
      "r.currentOrigin, s.origin and s.pos.trBase together with a teleport "

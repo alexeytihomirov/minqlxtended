@@ -53,14 +53,13 @@ __version_info__ = tuple(int(part) for part in _match.groups()) if _match else (
 from _minqlxtended import (  # noqa: F401
     # Functions.
     add_console_command, add_event, callvote, client_command, console_command, console_print,
-    cvar, cvars, demo_arm, demo_disarm, demo_status, destroy_kamikaze_timers,
-    dev_print_items, drop_holdable, drop_item, entities, force_vote,
-    force_weapon_respawn_time, get_cvar, get_userinfo, items, kick, link_entity,
-    player_expanded_stats, player_info, player_spawn, player_state, player_stats,
-    players_info, register_handler, reliable_status, remove_dropped_items, remove_entity,
-    replace_items, respawn_item, send_server_command, set_configstring, set_cvar,
-    set_cvar_limit, set_position, slay_with_mod, spawn_entity, spawn_item, start_demo,
-    start_stream, stop_demo, stop_stream, stream_status, unlink_entity,
+    cvar, cvars, demo_status, destroy_kamikaze_timers, dev_print_items, drop_holdable,
+    drop_item, entities, force_vote, force_weapon_respawn_time, get_cvar, get_userinfo,
+    items, kick, link_entity, player_expanded_stats, player_info, player_spawn, player_state,
+    player_stats, players_info, register_handler, reliable_status, remove_dropped_items,
+    remove_entity, replace_items, respawn_item, send_server_command, set_configstring,
+    set_cvar, set_cvar_limit, set_position, slay_with_mod, spawn_entity, spawn_item,
+    start_demo, start_stream, stop_demo, stop_stream, stream_status, unlink_entity,
     # Struct sequences. Snapshots, taken when you ask for them.
     DemoStatus, Flight, Keys, PlayerExpandedStats, PlayerInfo, PlayerState, PlayerStats,
     Powerups, ReliableStatus, StatHoldables, StatPowerups, StreamSlot, StreamStatus, Vector3,
