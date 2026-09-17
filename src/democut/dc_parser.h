@@ -58,6 +58,9 @@ struct dc_parser_s {
     int cutActive;
     int cutStartMs;
     int cutEndMs;
+    // Lower bound on the block sequence number at which the window may OPEN,
+    // or -1 for "time alone decides". See dc_parser_set_cut.
+    int cutStartSeq;
     int outWriteMessage;
     int outWriteFirstMessage;
     int outServerCommandSequence;
@@ -79,7 +82,13 @@ void dc_parser_destroy(dc_parser_t *p);
 // Arms the single cut this parser can perform. Must be called before the first
 // message. out_path is created lazily, when the first in-window message is
 // reached, exactly like UDT (so a cut that selects nothing leaves no file).
-void dc_parser_set_cut(dc_parser_t *p, int start_ms, int end_ms, const char *out_path);
+//
+// start_seq bounds WHERE in the file the window may open: no message whose own
+// block sequence number is below it can start the cut, however well its server
+// time fits [start_ms, end_ms]. Pass -1 for the old time-only behaviour. See
+// democut.h's demo_cut() for why a caller that knows the exact instant it wants
+// must pass it.
+void dc_parser_set_cut(dc_parser_t *p, int start_ms, int end_ms, int start_seq, const char *out_path);
 
 // Feeds one length-prefixed block's payload. seq is the block's own sequence
 // number from the .dm_91 framing.

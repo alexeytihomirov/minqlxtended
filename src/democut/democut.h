@@ -77,8 +77,22 @@ extern "C" {
 // all counts as a failure here, deliberately: the caller cannot tell an empty
 // scratch directory apart from a cut that selected nothing, and silently
 // shipping the untrimmed capture instead is the wrong default.
+//
+// start_seq is a lower bound on the BLOCK SEQUENCE NUMBER at which the window
+// may open (pass -1 for none, i.e. time alone decides). It exists because
+// [start_ms, end_ms] on its own cannot identify a point in a real capture: a
+// map_restart resets the server clock WITHOUT sending a fresh gamestate, so one
+// gamestate-0 file can hold two clock epochs whose numeric ranges overlap, and
+// the stale earlier one comes first - a time-only test opens the cut there and
+// the output carries a backward clock jump (seen live on 2026-09-17: every POV
+// of a match shipped untrimmed and unindexed for exactly this reason). Block
+// sequence numbers are monotonic over the whole file, so a caller that sampled
+// one at the instant it wants (demo_match.c's arm_seq, or demo_scan's live_seq)
+// can pin the opening edge exactly. The CLOSING edge is still time-only: a
+// reset after the opening edge is a genuinely unusable window, and callers gate
+// on clock_resets_since_arm / clock_resets_since_live for that.
 int demo_cut(const char *in_path, const char *out_folder,
-             int start_ms, int end_ms,
+             int start_ms, int end_ms, int start_seq,
              char *err_buf, int err_buf_len);
 
 // ---------------------------------------------------------------------------
@@ -124,6 +138,11 @@ typedef struct demo_scan_s {
     // move its window to this time.
     int live_ms;
 
+    // Block sequence number of the message that carried the live_ms snapshot,
+    // i.e. demo_cut()'s start_seq for a cut that starts at live_ms. -1 whenever
+    // live_ms is -1.
+    int live_seq;
+
     // Number of gamestate messages in the whole file. 1 for anything the normal
     // capture path produces; anything else means first_ms/last_ms/arm_ms only
     // describe the leading gamestate and demo_cut() must not be used.
@@ -150,6 +169,11 @@ typedef struct demo_scan_s {
     // really do overlap the requested range and the cut would be silently wrong
     // rather than failing.
     int clock_resets_since_arm;
+
+    // Same, counted from live_ms instead of arm_ms - for the caller that cuts
+    // [live_ms, last_ms] (demo_match.c's trim-only path) and therefore only
+    // cares about resets inside THAT region. -1 when arm_seq was negative.
+    int clock_resets_since_live;
 
     // Diagnostics. snapshot_count covers gamestate 0 only; message_count is the
     // whole file.

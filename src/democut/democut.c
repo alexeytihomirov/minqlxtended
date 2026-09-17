@@ -143,6 +143,11 @@ static void dc_on_snapshot(dc_parser_t *p, const dc_snapshot_t *snap, void *user
         if (s->arm_ms >= 0) {
             s->clock_resets_since_arm++;
         }
+        // Same reasoning, for a caller that cuts from live_ms instead of arm_ms
+        // (demo_match.c's trim-only path, which has no arm instant).
+        if (s->live_ms >= 0) {
+            s->clock_resets_since_live++;
+        }
     }
     s->last_ms = t;
     s->snapshot_count++;
@@ -152,6 +157,7 @@ static void dc_on_snapshot(dc_parser_t *p, const dc_snapshot_t *snap, void *user
     }
     if (st->pendingLive && s->live_ms < 0) {
         s->live_ms      = t;
+        s->live_seq     = st->curSeq;
         st->pendingLive = 0;
     }
 
@@ -178,8 +184,10 @@ static int dc_walk(const char *who, const char *in_path, int arm_seq, demo_scan_
     out->last_ms               = -1;
     out->arm_ms                = -1;
     out->live_ms               = -1;
+    out->live_seq              = -1;
     out->client_num            = -1;
-    out->clock_resets_since_arm = (arm_seq >= 0) ? 0 : -1;
+    out->clock_resets_since_arm  = (arm_seq >= 0) ? 0 : -1;
+    out->clock_resets_since_live = (arm_seq >= 0) ? 0 : -1;
 
     memset(st, 0, sizeof(*st));
     st->scan        = out;
@@ -378,7 +386,7 @@ static void dc_file_stem(const char *path, char *out, size_t out_len) {
     }
 }
 
-int demo_cut(const char *in_path, const char *out_folder, int start_ms, int end_ms,
+int demo_cut(const char *in_path, const char *out_folder, int start_ms, int end_ms, int start_seq,
              char *err_buf, int err_buf_len) {
     if (err_buf && err_buf_len > 0) {
         err_buf[0] = '\0';
@@ -419,7 +427,7 @@ int demo_cut(const char *in_path, const char *out_folder, int start_ms, int end_
         dc_err(err_buf, err_buf_len, "demo_cut: out of memory");
         return 1;
     }
-    dc_parser_set_cut(parser, start_ms, end_ms, outPath);
+    dc_parser_set_cut(parser, start_ms, end_ms, start_seq, outPath);
 
     demo_scan_t scan;
     dc_scan_state_t st;
@@ -435,9 +443,9 @@ int demo_cut(const char *in_path, const char *out_folder, int start_ms, int end_
     }
     if (outMessages == 0) {
         dc_err(err_buf, err_buf_len,
-               "demo_cut: window [%d,%d] selected no message of %s (its own range is [%d,%d], "
-               "%d snapshot(s), %d gamestate(s))",
-               start_ms, end_ms, in_path, scan.first_ms, scan.last_ms, scan.snapshot_count,
+               "demo_cut: window [%d,%d] (from seq %d) selected no message of %s (its own range is "
+               "[%d,%d], %d snapshot(s), %d gamestate(s))",
+               start_ms, end_ms, start_seq, in_path, scan.first_ms, scan.last_ms, scan.snapshot_count,
                scan.gamestate_count);
         remove(outPath);
         return 1;
@@ -446,8 +454,8 @@ int demo_cut(const char *in_path, const char *out_folder, int start_ms, int end_
         // A gamestate with nothing after it is a file the engine opens and then
         // sits on forever. Treat it as a failed cut rather than shipping it.
         dc_err(err_buf, err_buf_len,
-               "demo_cut: window [%d,%d] of %s produced a gamestate but no snapshot", start_ms, end_ms,
-               in_path);
+               "demo_cut: window [%d,%d] (from seq %d) of %s produced a gamestate but no snapshot",
+               start_ms, end_ms, start_seq, in_path);
         remove(outPath);
         return 1;
     }

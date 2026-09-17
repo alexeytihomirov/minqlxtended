@@ -61,8 +61,10 @@ static void print_json(const char *path, const demo_scan_t *s, const demo_index_
     printf("{\"file\":\"%s\",\"arm_seq\":%d,", path, arm_seq);
     printf("\"first_ms\":%d,\"last_ms\":%d,\"arm_ms\":%d,\"live_ms\":%d,", s->first_ms, s->last_ms,
            s->arm_ms, s->live_ms);
+    printf("\"live_seq\":%d,", s->live_seq);
     printf("\"gamestate_count\":%d,\"clock_resets\":%d,\"clock_resets_since_arm\":%d,", s->gamestate_count,
            s->clock_resets, s->clock_resets_since_arm);
+    printf("\"clock_resets_since_live\":%d,", s->clock_resets_since_live);
     printf("\"snapshot_count\":%d,\"message_count\":%d,\"client_num\":%d,", s->snapshot_count,
            s->message_count, s->client_num);
     printf("\"delta_unknown\":%d,\"snapshots\":[", idx->delta_unknown);
@@ -178,8 +180,9 @@ int main(int argc, char **argv) {
         printf("scan  arm_seq=%d -> arm_ms=%d (offset from first: %d ms), clock_resets_since_arm=%d\n",
                arm_seq, scan.arm_ms, (scan.arm_ms < 0) ? -1 : scan.arm_ms - scan.first_ms,
                scan.clock_resets_since_arm);
-        printf("scan  live_ms=%d (cs %d warmup->live at/after arm)\n", scan.live_ms,
-               DEMO_CS_WARMUP_INDEX);
+        printf("scan  live_ms=%d live_seq=%d (cs %d warmup->live at/after arm), "
+               "clock_resets_since_live=%d\n",
+               scan.live_ms, scan.live_seq, DEMO_CS_WARMUP_INDEX, scan.clock_resets_since_live);
         printf("scan  client_num=%d\n", scan.client_num);
         printf("index rows=%d delta_unknown=%d", idx.count, idx.delta_unknown);
         if (idx.count > 0) {

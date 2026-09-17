@@ -152,6 +152,7 @@ dc_parser_t *dc_parser_create(void) {
     p->inServerTime                  = INT32_MIN;
     p->inLastSnapshotMessageNumber   = INT32_MIN;
     p->inGameStateIndex              = -1;
+    p->cutStartSeq                   = -1;
     return p;
 }
 
@@ -167,10 +168,11 @@ void dc_parser_destroy(dc_parser_t *p) {
     free(p);
 }
 
-void dc_parser_set_cut(dc_parser_t *p, int start_ms, int end_ms, const char *out_path) {
-    p->cutActive  = 1;
-    p->cutStartMs = start_ms;
-    p->cutEndMs   = end_ms;
+void dc_parser_set_cut(dc_parser_t *p, int start_ms, int end_ms, int start_seq, const char *out_path) {
+    p->cutActive   = 1;
+    p->cutStartMs  = start_ms;
+    p->cutEndMs    = end_ms;
+    p->cutStartSeq = start_seq;
     snprintf(p->outPath, sizeof(p->outPath), "%s", out_path);
 }
 
@@ -812,8 +814,18 @@ int dc_parser_parse_message(dc_parser_t *p, const dc_byte *data, int len, int se
     if (p->cutActive) {
         const int gameTime = p->inServerTime;
 
+        // The sequence bound is checked ONLY here, on the opening edge, and
+        // deliberately not on the closing one: a capture can hold a stale,
+        // already-consumed epoch whose server times overlap the window that is
+        // wanted (a map_restart resets the server clock without sending a fresh
+        // gamestate, so both epochs sit in one gamestate-0 file). Time alone
+        // cannot tell those two epochs apart, and the earlier one comes first,
+        // so a time-only test opens the cut in the WRONG epoch and the output
+        // carries a backward clock jump. The block sequence number is
+        // monotonic over the whole file and is exactly what the caller sampled
+        // at the instant it cares about, so it is the one bound that can.
         if (p->inGameStateIndex == 0 && !p->outWriteMessage && gameTime >= p->cutStartMs &&
-            gameTime <= p->cutEndMs) {
+            gameTime <= p->cutEndMs && (p->cutStartSeq < 0 || seq >= p->cutStartSeq)) {
             p->outWriteMessage      = 1;
             p->outWriteFirstMessage = 1;
         } else if ((p->inGameStateIndex == 0 && p->outWriteMessage && gameTime > p->cutEndMs) ||

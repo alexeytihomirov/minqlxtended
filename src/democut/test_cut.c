@@ -6,7 +6,12 @@
 //         dc_fields.c dc_huffman.c
 //
 // Usage:
-//     ./test_cut <in.dm_91> <out_folder> <start_ms> [end_ms]
+//     ./test_cut <in.dm_91> <out_folder> <start_ms> [end_ms] [start_seq]
+//
+// start_seq is the optional lower bound on the block sequence number at which
+// the window may open (-1, the default, for none). Pass the arm sequence to
+// reproduce what production asks for; leave it off to reproduce a time-only
+// selection, including the two-epoch failure the checks below describe.
 //
 // out_folder must already exist and must be this call's own, exactly as
 // demo_cut()'s contract requires (see democut.h) - the harness verifies it
@@ -24,8 +29,9 @@
 // exactly one gamestate, the shipped first_ms inside the requested window, the
 // shipped last_ms not past end_ms, and no server-clock reset that the source did
 // not already have. That last qualifier matters - a raw capture can hold two
-// clock epochs, and a window spanning the reset correctly yields an output that
-// contains it; production refuses such a window upstream of this, on
+// clock epochs, and a time-only window that reaches the earlier one correctly
+// yields an output that contains the reset; production never asks for that,
+// because it pins the opening edge with start_seq and gates the rest on
 // demo_scan's clock_resets_since_arm.
 
 #include <dirent.h>
@@ -61,13 +67,16 @@ static int only_output(const char *dir, char *out, size_t out_len) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4 && argc != 5) {
-        fprintf(stderr, "usage: %s <in.dm_91> <out_folder> <start_ms> [end_ms]\n", argv[0]);
+    if (argc < 4 || argc > 6) {
+        fprintf(stderr, "usage: %s <in.dm_91> <out_folder> <start_ms> [end_ms] [start_seq]\n", argv[0]);
         return 2;
     }
 
     const int start_ms = atoi(argv[3]);
-    const int end_ms   = (argc == 5) ? atoi(argv[4]) : 2147483647;
+    const int end_ms   = (argc >= 5) ? atoi(argv[4]) : 2147483647;
+    // Optional, and -1 by default, so the harness keeps exercising the plain
+    // time-only selection unless a test explicitly pins the opening edge.
+    const int start_seq = (argc >= 6) ? atoi(argv[5]) : -1;
 
     char err[512];
 
@@ -84,7 +93,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (demo_cut(argv[1], argv[2], start_ms, end_ms, err, (int)sizeof(err)) != 0) {
+    if (demo_cut(argv[1], argv[2], start_ms, end_ms, start_seq, err, (int)sizeof(err)) != 0) {
         fprintf(stderr, "demo_cut failed: %s\n", err);
         return 1;
     }

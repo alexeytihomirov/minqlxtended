@@ -333,7 +333,8 @@ typedef struct {
 static struct {
     char match_id[64];
     int count;
-    int dropped; // segments published on their own because the table was full
+    int dropped;   // segments published on their own because the table was full
+    int published; // files that actually reached their final path, all paths counted
     demo_pov_t povs[DEMO_MAX_POVS_PER_MATCH];
 } g_fin_acc; // FINALIZE THREAD ONLY
 
@@ -453,11 +454,15 @@ static int demo_only_output(const char* dir, char* out, size_t out_len) {
 }
 
 // demo_cut() into a scratch directory of our own, returning the path it chose.
-// dir must not exist yet (or must be empty). Returns 1 on success.
-static int demo_cut_into(const char* src, const char* dir, int start_ms, int end_ms, char* out, size_t out_len) {
+// dir must not exist yet (or must be empty). start_seq pins the opening edge of
+// the window to a block sequence number (-1 for none) - see democut.h; every
+// caller here that HAS one passes it, because a capture can hold a stale clock
+// epoch whose times overlap the window wanted. Returns 1 on success.
+static int demo_cut_into(const char* src, const char* dir, int start_ms, int end_ms, int start_seq, char* out,
+                         size_t out_len) {
     demo_mkdir_p(dir);
     char err[256];
-    if (demo_cut(src, dir, start_ms, end_ms, err, (int)sizeof(err)) != 0) {
+    if (demo_cut(src, dir, start_ms, end_ms, start_seq, err, (int)sizeof(err)) != 0) {
         DebugPrint("demo: cut of %s [%d,%d] failed: %s\n", src, start_ms, end_ms, err);
         return 0;
     }
@@ -830,6 +835,7 @@ static void demo_pov_publish(demo_pov_t* p, const char* why) {
         why = "untrimmed copy-through";
     }
     if (p->source[0] && demo_publish(p->source, p->final_path)) {
+        g_fin_acc.published++;
         DebugPrint("demo: finalised %s (%s)\n", p->final_path, why);
         // The file is now in its final form, so this is where its index can be
         // built (see demo_write_index). Stage-2-cut POVs never reach here - they
@@ -855,14 +861,23 @@ static void demo_acc_reset(void) {
     g_fin_acc.match_id[0] = '\0';
     g_fin_acc.count       = 0;
     g_fin_acc.dropped     = 0;
+    g_fin_acc.published   = 0;
 }
 
 // STAGE 2. Every POV of g_fin_acc.match_id has been through stage 1; force them
 // all onto one shared server-time window and publish.
-static void demo_stage2_flush(void) {
+//
+// Returns how many files actually reached their final path. The caller needs
+// that to decide whether the match is worth telling Python about at all: a match
+// that armed and shipped nothing (a countdown whose captures all failed, an arm
+// a map change outran) used to fire demo_match_finalized anyway, which started a
+// packer run that could only ever fail with "no <match_id>_*.dm_91 files" and
+// leave a stub .packer.log in the demo directory for the operator to wonder at.
+static int demo_stage2_flush(void) {
     if (g_fin_acc.count <= 0) {
+        int published = g_fin_acc.published;
         demo_acc_reset();
-        return;
+        return published;
     }
 
     // PASS 1: the extremes, over every cuttable POV. These only locate the
@@ -936,8 +951,9 @@ static void demo_stage2_flush(void) {
         DebugPrint("demo: match %s finalised with %d file(s), %d cuttable, %d covering "
                    "[%d,%d]: fewer than 2 clock-alignable POVs, no shared-window cut\n",
                    g_fin_acc.match_id, g_fin_acc.count, cuttable, aligned, win_start, win_end);
+        int published = g_fin_acc.published;
         demo_acc_reset();
-        return;
+        return published;
     }
 
     // Applied to the outlier-resistant window, not to the naive intersection:
@@ -955,8 +971,9 @@ static void demo_stage2_flush(void) {
         for (int i = 0; i < g_fin_acc.count; i++) {
             demo_pov_publish(&g_fin_acc.povs[i], "window too short");
         }
+        int published = g_fin_acc.published;
         demo_acc_reset();
-        return;
+        return published;
     }
 
     DebugPrint("demo: match %s shared window [%d,%d] (%d ms) over %d of %d cuttable POVs "
@@ -998,7 +1015,10 @@ static void demo_stage2_flush(void) {
             demo_pov_publish(p, "stage 2 skipped, stage-1 file kept");
             continue;
         }
-        if (!demo_cut_into(p->source, dir, win_start, win_end, cut, sizeof(cut))) {
+        // -1: a stage-1 output is a single clean clock epoch by construction
+        // (demo_stage1 refuses to publish anything else), so there is no stale
+        // epoch for the window to open in and no sequence to pin it to.
+        if (!demo_cut_into(p->source, dir, win_start, win_end, -1, cut, sizeof(cut))) {
             demo_purge_dir(dir);
             demo_pov_publish(p, "stage 2 failed, stage-1 file kept");
             continue;
@@ -1016,6 +1036,7 @@ static void demo_stage2_flush(void) {
         demo_purge_dir(p->stage_dir);
         p->source[0]    = '\0';
         p->stage_dir[0] = '\0';
+        g_fin_acc.published++;
         DebugPrint("demo: finalised %s (slot %d, window [%d,%d])\n", p->final_path, p->slot, win_start,
                    win_end);
 
@@ -1089,7 +1110,9 @@ static void demo_stage2_flush(void) {
                    "(more than %d segments in one match)\n",
                    g_fin_acc.match_id, g_fin_acc.dropped, DEMO_MAX_POVS_PER_MATCH);
     }
+    int published = g_fin_acc.published;
     demo_acc_reset();
+    return published;
 }
 
 // STAGE 1. Turns one capture into a countdown-trimmed file and parks it in the
@@ -1100,6 +1123,7 @@ static void demo_stage1(const demo_finalize_job_t* job) {
         // strictly better than dropping it, and the count is logged at flush.
         g_fin_acc.dropped++;
         if (demo_publish(job->raw_path, job->final_path)) {
+            g_fin_acc.published++;
             unlink(job->raw_path);
         }
         return;
@@ -1166,15 +1190,18 @@ static void demo_stage1(const demo_finalize_job_t* job) {
         DebugPrint("demo: stage-1 scratch path too long for %s; copying untrimmed\n", job->raw_path);
         return;
     }
-    // end = scan.last_ms (this file's own true last snapshot), NOT
-    // DEMO_CUT_TO_END/INT32_MAX: a stale pre-arm epoch (see above) can carry
-    // HIGHER timestamps than our own match's (server time reset DOWNWARD
-    // between them), which would satisfy an unbounded "arm_ms <= t <= MAX"
-    // selection and smuggle that unrelated data into the cut. Bounding end to
-    // this scan's own last_ms costs nothing for the common single-epoch case
-    // (last_ms already IS the true end there) and excludes any pre-arm epoch
-    // whose range lies above it.
-    if (!demo_cut_into(job->raw_path, dir, scan.arm_ms, scan.last_ms, cut, sizeof(cut))) {
+    // job->arm_seq is what keeps a stale pre-arm epoch (see above) out of the
+    // cut: its times can sit anywhere relative to our match's - BELOW arm_ms,
+    // above last_ms, or straddling the whole window - so no [start_ms, end_ms]
+    // pair can exclude it, and the epoch that comes FIRST in the file is the one
+    // a time-only selection opens on. Passing the sequence the match armed at
+    // pins the opening edge to the right epoch outright (democut.h's start_seq).
+    //
+    // end = scan.last_ms (this file's own true last snapshot) rather than
+    // DEMO_CUT_TO_END/INT32_MAX all the same: with the opening edge pinned, the
+    // closing one only has to stop at the real end of the data, and a concrete
+    // bound keeps the cut from running on into anything a later epoch might add.
+    if (!demo_cut_into(job->raw_path, dir, scan.arm_ms, scan.last_ms, job->arm_seq, cut, sizeof(cut))) {
         demo_purge_dir(dir);
         DebugPrint("demo: slot %d stage 1 failed for %s; copying untrimmed\n", job->slot, job->raw_path);
         return;
@@ -1247,11 +1274,6 @@ static void demo_trim_only(const demo_finalize_job_t* job) {
                    scan.gamestate_count);
         return;
     }
-    if (scan.clock_resets_since_arm != 0) {
-        DebugPrint("demo: sv_demoCut: %s has %d clock reset(s); leaving it uncut\n", job->raw_path,
-                   scan.clock_resets_since_arm);
-        return;
-    }
     if (scan.live_ms < 0) {
         // Never went live: pure warmup, or a spectator/observer capture with no
         // match in it at all. Nothing a cut would keep - same disposal as an
@@ -1262,13 +1284,25 @@ static void demo_trim_only(const demo_finalize_job_t* job) {
         return;
     }
 
+    // Only a reset INSIDE [live_ms, last_ms] makes this uncuttable. A reset
+    // BEFORE live_ms belongs to a stale epoch the cut now skips outright, since
+    // live_seq pins the window's opening edge past it (demo_cut's start_seq).
+    // Counting those too - which is what checking clock_resets_since_arm with
+    // arm_seq 0 amounted to, arm_ms being the very first snapshot there - left
+    // every capture that outlived a map_restart uncut.
+    if (scan.clock_resets_since_live != 0) {
+        DebugPrint("demo: sv_demoCut: %s has %d clock reset(s) at/after going live; leaving it uncut\n",
+                   job->raw_path, scan.clock_resets_since_live);
+        return;
+    }
+
     char dir[DEMO_LONG_PATH];
     char cut[DEMO_LONG_PATH];
     if (!demo_stage_dir(dir, sizeof(dir), job->raw_path, "tc")) {
         DebugPrint("demo: sv_demoCut: stage path too long for %s; leaving it uncut\n", job->raw_path);
         return;
     }
-    if (!demo_cut_into(job->raw_path, dir, scan.live_ms, scan.last_ms, cut, sizeof(cut))) {
+    if (!demo_cut_into(job->raw_path, dir, scan.live_ms, scan.last_ms, scan.live_seq, cut, sizeof(cut))) {
         demo_purge_dir(dir);
         DebugPrint("demo: sv_demoCut: cut of %s failed; leaving it uncut\n", job->raw_path);
         return;
@@ -1342,10 +1376,15 @@ static void* demo_finalize_main(void* unused) {
             demo_stage1(job);
         }
         if (job->last_for_match) {
-            demo_stage2_flush();
-            DebugPrint("demo: match %s finalised\n", job->match_id);
+            int published = demo_stage2_flush();
+            DebugPrint("demo: match %s finalised, %d file(s) shipped\n", job->match_id, published);
 #ifndef NOPY
-            DemoMatchFinalizedDispatcher(job->match_id);
+            // Nothing shipped means there is nothing for a consumer to pack or
+            // archive; see demo_stage2_flush for why firing anyway is worse than
+            // staying quiet.
+            if (published > 0) {
+                DemoMatchFinalizedDispatcher(job->match_id);
+            }
 #endif
         }
         free(job);
@@ -1590,7 +1629,23 @@ static void demo_seg_arm(demo_seg_t* s) {
 // A new segment for this slot. Returns its index in g_seg, or -1 when the table
 // is full (in which case upstream simply keeps the file under its own name -
 // still a valid demo, just not part of any .qlmatch).
+//
+// Idempotent per (slot, path): an already-tracked segment for the same open file
+// is adopted rather than duplicated. That is not belt-and-braces - the engine
+// calls ClientConnect (firstTime false) for every connected client on a plain
+// map_restart, which is NOT a map change and does NOT give them a fresh
+// gamestate, so DemoMatch_OnClientConnect drops g_cur[slot] while upstream's
+// file for that slot stays open under the same name. Without this check the next
+// frame opened a SECOND record for that one file, armed it as a second POV of
+// the live match, and then waited DEMO_CLOSE_TIMEOUT_S for a completion that can
+// never arrive (one file, one completion) - measured live on 2026-09-17: 8
+// segments for 4 files, the match finalising 30 s late.
 static int demo_seg_open(int slot, const char* path) {
+    for (int i = 0; i < DEMO_MAX_PENDING; i++) {
+        if (g_seg[i].used && g_seg[i].slot == slot && !strcmp(g_seg[i].path, path)) {
+            return i;
+        }
+    }
     for (int i = 0; i < DEMO_MAX_PENDING; i++) {
         if (g_seg[i].used) {
             continue;
