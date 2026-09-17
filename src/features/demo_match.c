@@ -207,6 +207,7 @@ static cvar_t* sv_demoRecord;
 static cvar_t* fs_homepath;
 static cvar_t* qlx_nativeDemoRecordEnabled;
 static cvar_t* qlx_nativeDemoUnarmedTimeout;
+static cvar_t* sv_demoCut;
 
 // ---------------------------------------------------------------------------
 // Small helpers, ported unchanged from the pre-port demos.c body. They are
@@ -307,6 +308,11 @@ typedef struct {
     int32_t arm_seq;    // netchan outgoingSequence at the instant the match armed
     int slot;
     int last_for_match; // terminal marker: no file, just "this match is done"
+    // sv_demoCut job: raw_path is the only field that matters (final_path and
+    // match_id are left empty). Handled by demo_trim_only() before this job
+    // would otherwise touch g_fin_acc/match_id at all - see the dispatch in
+    // demo_finalize_main().
+    int trim_only;
 } demo_finalize_job_t;
 
 static demo_finalize_job_t* demo_fin_queue[DEMO_FINALIZE_QUEUE_SIZE];
@@ -567,7 +573,7 @@ static void demo_stage_sweep_dir(const char* dir, int depth, time_t cutoff, unsi
         }
 
         // Not one of ours: recurse, because sv_demoNameFormat may nest.
-        if (strncmp(e->d_name, ".s1_", 4) && strncmp(e->d_name, ".s2_", 4)) {
+        if (strncmp(e->d_name, ".s1_", 4) && strncmp(e->d_name, ".s2_", 4) && strncmp(e->d_name, ".tc_", 4)) {
             if (depth + 1 < DEMO_STAGE_SWEEP_DEPTH) {
                 demo_stage_sweep_dir(path, depth + 1, cutoff, removed, kept);
             }
@@ -1243,6 +1249,74 @@ static void demo_stage1(const demo_finalize_job_t* job) {
                (scan.live_ms >= 0) ? " (match went live inside the kept range)" : "");
 }
 
+// sv_demoCut's whole job: a capture no match ever armed, trimmed down to
+// [match went live, end of file] and published back over its own path.
+//
+// Deliberately NOT run through demo_stage1()/g_fin_acc: those exist to align
+// several POVs of one match onto a shared window, which has no meaning here -
+// there is no match, no arm_seq and no second POV to agree with. Kept as its
+// own small function instead of teaching demo_stage1 a "no match" mode so a
+// trim job can never accidentally touch match bookkeeping it has nothing to do
+// with (see the dispatch in demo_finalize_main(), which routes trim_only jobs
+// here before the match_id/g_fin_acc logic even looks at them).
+//
+// arm_seq 0, not -1: passing a negative arm_seq to demo_scan() is the
+// documented way to SKIP the arm_ms/live_ms lookup entirely (see democut.h),
+// which is the opposite of what this needs. 0 is a valid netchan sequence
+// number and every message in the file has a sequence at or above it, so this
+// reads as "count from the very start of the capture" - the correct stand-in
+// for "no arm point, the whole file is fair game".
+static void demo_trim_only(const demo_finalize_job_t* job) {
+    char err[256];
+    demo_scan_t scan;
+    if (demo_scan(job->raw_path, 0, &scan, err, (int)sizeof(err)) != 0) {
+        DebugPrint("demo: sv_demoCut scan of %s failed (%s); leaving it uncut\n", job->raw_path, err);
+        return;
+    }
+    if (scan.gamestate_count != 1) {
+        // A stranded or hand-recovered file - same guard as demo_stage1, same
+        // reason: demo_cut()'s selection has no notion of gamestate boundaries.
+        DebugPrint("demo: sv_demoCut: %s has %d gamestate(s); leaving it uncut\n", job->raw_path,
+                   scan.gamestate_count);
+        return;
+    }
+    if (scan.clock_resets_since_arm != 0) {
+        DebugPrint("demo: sv_demoCut: %s has %d clock reset(s); leaving it uncut\n", job->raw_path,
+                   scan.clock_resets_since_arm);
+        return;
+    }
+    if (scan.live_ms < 0) {
+        // Never went live: pure warmup, or a spectator/observer capture with no
+        // match in it at all. Nothing a cut would keep - same disposal as an
+        // unclaimed capture nothing was ever going to want.
+        if (unlink(job->raw_path) == 0) {
+            DebugPrint("demo: sv_demoCut: %s never went live; removed\n", job->raw_path);
+        }
+        return;
+    }
+
+    char dir[DEMO_LONG_PATH];
+    char cut[DEMO_LONG_PATH];
+    if (!demo_stage_dir(dir, sizeof(dir), job->raw_path, "tc")) {
+        DebugPrint("demo: sv_demoCut: stage path too long for %s; leaving it uncut\n", job->raw_path);
+        return;
+    }
+    if (!demo_cut_into(job->raw_path, dir, scan.live_ms, scan.last_ms, cut, sizeof(cut))) {
+        demo_purge_dir(dir);
+        DebugPrint("demo: sv_demoCut: cut of %s failed; leaving it uncut\n", job->raw_path);
+        return;
+    }
+
+    if (demo_publish(cut, job->raw_path)) {
+        DebugPrint("demo: sv_demoCut: %s trimmed to [%d,%d] of [%d,%d]\n", job->raw_path, scan.live_ms,
+                   scan.last_ms, scan.first_ms, scan.last_ms);
+    } else {
+        DebugPrint("demo: sv_demoCut: could not publish cut of %s in place; leaving it uncut\n",
+                   job->raw_path);
+    }
+    demo_purge_dir(dir);
+}
+
 static void* demo_finalize_main(void* unused) {
     (void)unused;
 
@@ -1269,6 +1343,16 @@ static void* demo_finalize_main(void* unused) {
         pthread_mutex_unlock(&demo_fin_lock);
 
         if (!job) {
+            continue;
+        }
+
+        if (job->trim_only) {
+            // Never let a trim job reach the match_id/g_fin_acc logic below: it
+            // has no match_id, and the two share this queue - an unarmed
+            // client's disconnect can land here mid-match, between two of that
+            // match's own stage-1 jobs.
+            demo_trim_only(job);
+            free(job);
             continue;
         }
 
@@ -1421,6 +1505,14 @@ static void demo_cvars_ensure(void) {
     if (!qlx_nativeDemoUnarmedTimeout) {
         qlx_nativeDemoUnarmedTimeout = Cvar_FindVar("qlx_nativeDemoUnarmedTimeout");
     }
+    // Ours to register, unlike the two above: this is a plain sv_-family demo
+    // knob (like sv_demoRecord/sv_demoDir, which demos.c owns), not something a
+    // Python addon or an operator config line introduces on its own. demos.c
+    // itself stays untouched upstream code (see the comment above
+    // demo_sanitise), so it is registered from here instead.
+    if (!sv_demoCut) {
+        sv_demoCut = Cvar_Get("sv_demoCut", "0", CVAR_ARCHIVE);
+    }
 
     // Once per process, on the first call that can actually resolve the demo
     // directory: clear stage directories orphaned by a previous run. Deliberately
@@ -1460,6 +1552,19 @@ static int demo_unarmed_timeout_s(void) {
 static int demo_upstream_records(void) {
     demo_cvars_ensure();
     return sv_demoRecord && sv_demoRecord->integer != 0;
+}
+
+// sv_demoCut: trim the pre-match warmup out of a finished capture that no match
+// ever armed, instead of the two outcomes it would otherwise get (deleted once
+// qlx_nativeDemoUnarmedTimeout expires, or kept full-length forever under
+// sv_demoRecord=1). Deliberately independent of qlx_nativeDemoRecordEnabled and
+// of the arm/disarm machinery entirely: this applies to every capture
+// DemoMatch_Frame tracks, including ones that exist purely because sv_demoRecord
+// is set with no match-arming plugin in the picture at all - that server is
+// exactly who asked for this cvar.
+static int demo_cut_enabled(void) {
+    demo_cvars_ensure();
+    return sv_demoCut && sv_demoCut->integer != 0;
 }
 
 static int demo_slot_connected(int slot) {
@@ -1839,6 +1944,28 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
     } else if (armed) {
         DebugPrint("demo: slot %d segment %s %s; nothing to cut for match %s\n", done->slot, done->path,
                    done->discarded ? "held only a gamestate" : "failed in the writer", match_id);
+    } else if (!done->discarded && !done->failed && demo_cut_enabled()) {
+        // sv_demoCut=1: trim this capture instead of either fate below - not
+        // gated on `ours`/demo_upstream_records()/demo_unarmed_timeout_s() at
+        // all, because those three exist to decide whether an unclaimed capture
+        // is worth deleting, and this cvar's whole point is that it no longer
+        // is: cut it down to the match instead. Applies equally to a segment
+        // that exists only because sv_demoRecord=1 keeps everyone recorded
+        // forever - the case the branch below can never touch.
+        demo_finalize_job_t* job = (demo_finalize_job_t*)calloc(1, sizeof(*job));
+        if (!job) {
+            DebugPrint("demo: out of memory trimming %s\n", done->path);
+        } else {
+            snprintf(job->raw_path, sizeof(job->raw_path), "%s", done->path);
+            job->seed_at   = s->seed_at;
+            job->slot      = done->slot;
+            job->trim_only = 1;
+            demo_finalize_ensure(); // may be the first job ever queued, if no match has armed yet
+            if (demo_finalize_push(job) != 0) {
+                DebugPrint("demo: finalize queue full, leaving %s in place\n", done->path);
+                free(job);
+            }
+        }
     } else if (ours && !done->discarded && !demo_upstream_records() && demo_unarmed_timeout_s() > 0) {
         // Never bound to a match, and it only existed because this file asked for
         // it at connect time. It cannot become a POV of anything now - the record
