@@ -1315,6 +1315,42 @@ static PyObject* PyMinqlxtended_PlayerStats(PyObject* self, PyObject* args) {
     return stats;
 }
 
+// set_position
+
+static PyObject* PyMinqlxtended_SetPosition(PyObject* self, PyObject* args) {
+    int client_id;
+    PyObject* new_position;
+    vec3_t origin;
+    int i;
+
+    if (!PyArg_ParseTuple(args, "iO!:set_position", &client_id, &vector3_type, &new_position)) {
+        return NULL;
+    }
+
+    gentity_t* ent = qlx_live_client(client_id);
+    if (!ent) {
+        return NULL;
+    }
+
+    origin[0] = (float)PyFloat_AsDouble(PyStructSequence_GetItem(new_position, 0));
+    origin[1] = (float)PyFloat_AsDouble(PyStructSequence_GetItem(new_position, 1));
+    origin[2] = (float)PyFloat_AsDouble(PyStructSequence_GetItem(new_position, 2));
+
+    for (i = 0; i < 3; i++) {
+        ent->client->ps.origin[i] = origin[i];
+        ent->r.currentOrigin[i] = origin[i];
+        ent->s.origin[i] = origin[i];
+        ent->s.pos.trBase[i] = origin[i];
+    }
+    ent->s.pos.trType = TR_STATIONARY;
+    ent->client->ps.velocity[0] = 0.0f;
+    ent->client->ps.velocity[1] = 0.0f;
+    ent->client->ps.velocity[2] = 0.0f;
+    ent->client->ps.eFlags ^= EF_TELEPORT_BIT;
+
+    Py_RETURN_TRUE;
+}
+
 // drop_holdable
 
 void __cdecl Switch_Touch_Item(gentity_t* ent) {
@@ -2736,6 +2772,10 @@ static PyMethodDef minqlxtendedMethods[] = {
      "does.\n\n"
      "Unlinked entities stop colliding and stop being sent to clients; r.linked reads "
      "back False. Game thread only."},
+    {"set_position", PyMinqlxtended_SetPosition, METH_VARARGS,
+     "set_position(client_id, position) -- atomically writes ps.origin, "
+     "r.currentOrigin, s.origin and s.pos.trBase together with a teleport "
+     "flag flip; a four-field write no single typed attribute can express."},
     {NULL, NULL, 0, NULL}};
 
 // "_minqlxtended" matches PyImport_AppendInittab. m_name becomes __name__, and if it disagrees
