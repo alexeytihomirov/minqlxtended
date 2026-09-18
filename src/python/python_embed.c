@@ -53,6 +53,8 @@ PyObject* kamikaze_use_handler     = NULL;
 PyObject* kamikaze_explode_handler = NULL;
 
 PyObject* demo_finished_handler = NULL;
+PyObject* demo_recording_started_handler = NULL;
+PyObject* demo_match_finalized_handler = NULL;
 PyObject* demo_stream_handler   = NULL;
 
 PyObject* player_death_handler = NULL;
@@ -117,6 +119,8 @@ static handler_t handlers[] = {
     {"kamikaze_explode", &kamikaze_explode_handler},
 
     {"demo_finished", &demo_finished_handler},
+    {"demo_recording_started", &demo_recording_started_handler},
+    {"demo_match_finalized", &demo_match_finalized_handler},
     {"demo_stream", &demo_stream_handler},
 
     {"player_death", &player_death_handler},

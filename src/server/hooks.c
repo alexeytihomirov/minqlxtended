@@ -31,6 +31,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "common.h"
 #include "features/console_command.h"
+#include "features/demo_match.h"
 #include "features/demos.h"
 #include "hook/patches.h"
 #include "maps_parser.h"
@@ -155,9 +156,17 @@ static void DrainFinishedDemos(void) {
 
     demo_finished_t done;
     while (Demo_PollFinished(&done)) {
-        if (done.failed) {
+        // A snapshot completion describes a COPY of a capture that is still
+        // recording, so it must not abandon the slot: the only failure it can
+        // report is the copy's, and the capture itself is untouched.
+        if (done.failed && !done.snapshot) {
             Demo_AbandonSlot(done.slot, done.gen);
         }
+        // Inert in a nopy build - GameEvents_Frame does not run there, so no
+        // match ever arms and no segment is tracked - but kept symmetrical
+        // with the pygame drain so the two never have to be reasoned about
+        // separately.
+        DemoMatch_OnFinished(&done);
     }
 
     unsigned dropped = Demo_TakeDroppedCount();
@@ -213,6 +222,7 @@ void __cdecl My_SV_SpawnServer(char* server, qboolean killBots) {
     Scoreboard_Reset(); // ...as does anything we were part-way through trimming
 #endif
 
+    DemoMatch_OnCloseAll(); // ...and close the match out, so its files still get cut and indexed
     Demo_CloseAll(); // map change: finalise open demos; each client re-primes with a fresh gamestate
     Stream_CloseAll();
 
@@ -432,10 +442,16 @@ static void DispatchFinishedDemos(void) {
 
     demo_finished_t done;
     while (Demo_PollFinished(&done)) {
-        if (done.failed) {
+        // See the note in DrainFinishedDemos: a snapshot is a copy of a capture
+        // that is still running, not that capture ending, so neither the abandon
+        // nor the demo_finished event applies to it.
+        if (done.failed && !done.snapshot) {
             Demo_AbandonSlot(done.slot, done.gen);
         }
-        DemoFinishedDispatcher(done.slot, done.path, done.bytes, done.discarded, done.failed);
+        DemoMatch_OnFinished(&done);
+        if (!done.snapshot) {
+            DemoFinishedDispatcher(done.slot, done.path, done.bytes, done.discarded, done.failed);
+        }
     }
 
     unsigned dropped = Demo_TakeDroppedCount();
@@ -460,7 +476,15 @@ char* __cdecl My_ClientConnect(int clientNum, qboolean firstTime, qboolean isBot
         }
     }
 
-    return ClientConnect(clientNum, firstTime, isBot);
+    char* rejected = ClientConnect(clientNum, firstTime, isBot);
+    if (!rejected) {
+        // Before the engine sends this client's gamestate, so upstream's capture
+        // opens their segment at it. Also fires with firstTime false, i.e. for
+        // every client carried across a map change, which is where they each get
+        // their next fresh gamestate.
+        DemoMatch_OnClientConnect(clientNum);
+    }
+    return rejected;
 }
 
 // Deaths. G_Damage reaches player_die through ent->die, but Cmd_Kill_f and ExecuteTeamChange
@@ -670,6 +694,7 @@ void __cdecl My_G_RunFrame(int time) {
         FrameDispatcher();
 
         PROF_BEGIN(t_demos);
+        DemoMatch_Frame();
         DispatchFinishedDemos();
         PROF_END(PROF_DEMO_DISPATCH, t_demos);
 
