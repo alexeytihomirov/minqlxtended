@@ -67,6 +67,15 @@
 // raw one. Failure paths leave the raw capture in place, which is a valid demo
 // under an ordinary upstream name rather than a lost recording.
 //
+// A capture is NOT ended when the match inside it ends. It is copied, under a
+// dot-prefixed name in a ".sn_cache" staging directory beside the demos, and the
+// copy is what gets cut; the capture itself keeps running. That is what lets two
+// matches be played back-to-back on one map: the map_restart that starts the
+// second one sends no fresh gamestate, and a .dm_91 must begin at one, so a
+// capture closed at the end of match 1 could never be reopened for match 2.
+// Once such a capture finally does end, its own file is removed rather than
+// trimmed and kept - every match in it has already shipped from its own copy.
+//
 // A capture that no match ever claims - a client who connected and left during
 // warmup, an aborted countdown, a warmup-only session - is handed to the same
 // finalize thread as a trim-only job: cut down to [went-live, end] if a match
@@ -557,7 +566,8 @@ static void demo_stage_sweep_dir(const char* dir, int depth, time_t cutoff, unsi
         }
 
         // Not one of ours: recurse, because sv_demoNameFormat may nest.
-        if (strncmp(e->d_name, ".s1_", 4) && strncmp(e->d_name, ".s2_", 4) && strncmp(e->d_name, ".tc_", 4)) {
+        if (strncmp(e->d_name, ".s1_", 4) && strncmp(e->d_name, ".s2_", 4) && strncmp(e->d_name, ".tc_", 4) &&
+            strncmp(e->d_name, ".sn_", 4)) {
             if (depth + 1 < DEMO_STAGE_SWEEP_DEPTH) {
                 demo_stage_sweep_dir(path, depth + 1, cutoff, removed, kept);
             }
@@ -1471,6 +1481,11 @@ typedef struct {
     // Bound at a mid-match join rather than at the countdown, so its shipped POV
     // starts sv_demoCutJoinLead seconds before arm_seq instead of at it.
     int joined_late;
+    // At least one match was cut out of this capture through a snapshot and has
+    // already shipped. What is still on disk under s->path is the whole file -
+    // warmup and every match in it - so at completion it is removed rather than
+    // trimmed and kept, which would republish a match a second time.
+    int served_match;
     // A match was LIVE at some point while this segment was open. Only matters
     // for a segment that never got armed: that combination is a spectator's
     // camera follow of a real match, and sv_demoCut throws it away rather than
@@ -1493,6 +1508,33 @@ static int g_cur_init;
 // soon as the slot stops recording; a disconnect clears it for free (upstream
 // resets the override in Demo_ClientDisconnect).
 static int g_close_pending[MAX_DEMO_CLIENTS];
+
+// Per slot: the match a snapshot of this slot's capture is still being taken
+// for, or seg < 0 when there is none.
+//
+// The completion carries the COPY's path rather than the capture's, so
+// demo_seg_find cannot place it and this record is what does. It holds the
+// match's own fields rather than reading them back off the segment, because the
+// segment is unbound the moment the copy is REQUESTED: the next match can arm it
+// while the copy is still being written, and a countdown two seconds after the
+// last one is not a case worth being fragile about.
+//
+// One at a time per slot, which is also what keeps a second disarm from stacking
+// another copy on top of an unfinished one.
+typedef struct {
+    int seg; // g_seg index the copy was taken from, or -1 for "nothing pending"
+    char capture_path[520]; // that segment's file, to tell a recycled record apart
+    char final_path[512];
+    char match_id[64];
+    time_t seed_at;
+    int32_t arm_seq;
+    int join_lead_ms;
+} demo_pending_snap_t;
+static demo_pending_snap_t g_snap[MAX_DEMO_CLIENTS];
+
+// Per-snapshot discriminator, for the same reason demo_seg_build_final has one:
+// two matches of the same slot can otherwise collide inside a second.
+static uint32_t g_snap_seq;
 
 static int g_armed;
 // The armed match has been seen live (game_start). A match that ends was
@@ -1521,7 +1563,8 @@ static void demo_cur_init(void) {
         return;
     }
     for (int i = 0; i < MAX_DEMO_CLIENTS; i++) {
-        g_cur[i] = -1;
+        g_cur[i]      = -1;
+        g_snap[i].seg = -1;
     }
     g_cur_init = 1;
 }
@@ -1916,6 +1959,138 @@ static void demo_match_id_now(char* out, size_t n) {
     strftime(out, n, "%Y%m%dT%H%M%SZ", &tm);
 }
 
+// Where a mid-capture snapshot lands, before the cut turns it into a POV.
+//
+// One shared staging directory rather than one per capture, so nothing has to
+// clean an empty directory up afterwards: the files inside are unlinked by the
+// same paths that already dispose of a finished capture (demo_stage1 after a
+// successful cut, demo_pov_publish after a copy-through). Dot-prefixed so
+// neither a consumer's "{match_id}_*.dm_91" glob nor a plain listing of the demo
+// directory ever sees one, and the file name itself starts "sn_" rather than
+// with the match_id, so a consumer globbing "{match_id}_*.dm_91" cannot pick up
+// a snapshot even if it recurses. Prefixed ".sn_" specifically so the startup sweep
+// in demo_stage_sweep_dir treats it like the other staging directories and
+// clears out whatever a crash mid-finalize orphaned in it.
+static int demo_snapshot_path(char* out, size_t out_len, const char* match_id, int slot) {
+    demo_cvars_ensure();
+    if (!fs_homepath || !fs_homepath->string[0]) {
+        return 0;
+    }
+    const char* subdir = (sv_demoDir && sv_demoDir->string[0]) ? sv_demoDir->string : "demos";
+    int written        = snprintf(out, out_len, "%s/%s/.sn_cache/sn_%s_s%02d_%u.dm_91", fs_homepath->string,
+                                  subdir, match_id, slot, (unsigned)++g_snap_seq);
+    return (written > 0 && (size_t)written < out_len);
+}
+
+// End this segment's part in the match that is closing, without ending the
+// recording if that can be helped.
+//
+// Preferred: copy the capture as it stands (Demo_Snapshot) and leave it running.
+// The capture then survives the map_restart a server does to get from one match
+// to the next on the same map - a restart sends no fresh gamestate, and a .dm_91
+// has to begin at one - so the NEXT match still has an open capture to arm. That
+// is the whole of the "back-to-back matches record nothing" hole this used to
+// have; see the note above demo_disarm_match.
+//
+// Fallback, when no copy can be had (no writeable path, ring full, or one
+// already in flight for this slot): close it, which is what this always did.
+// -1, not 0: 0 means "follow sv_demoRecord", which is set on any server this
+// machinery runs on and would leave the segment open past the end of the match,
+// so its file would never be cut, indexed or packed. -1 closes it on this
+// client's next outgoing message, which is this frame or the next; DemoMatch_Frame
+// then owes upstream the reset back to 0 - see g_close_pending.
+static void demo_seg_close_for_match(demo_seg_t* s) {
+    demo_pending_snap_t* pend = &g_snap[s->slot];
+    char snap[DEMO_SNAPSHOT_PATH_MAX];
+
+    if (pend->seg < 0 && demo_snapshot_path(snap, sizeof(snap), s->match_id, s->slot) &&
+        Demo_Snapshot(s->slot, snap)) {
+        // Everything the cut will need, taken now rather than read back off the
+        // segment when the copy lands - by then the next match may already have
+        // armed this very segment for itself.
+        pend->seg          = (int)(s - g_seg);
+        pend->seed_at      = s->seed_at;
+        pend->arm_seq      = s->arm_seq;
+        pend->join_lead_ms = s->joined_late ? demo_join_lead_ms() : 0;
+        snprintf(pend->capture_path, sizeof(pend->capture_path), "%.*s", (int)sizeof(s->path) - 1, s->path);
+        snprintf(pend->final_path, sizeof(pend->final_path), "%s", s->final_path);
+        snprintf(pend->match_id, sizeof(pend->match_id), "%s", s->match_id);
+
+        DebugPrint("demo: slot %d snapshotting %s for %s; capture stays open\n", s->slot, s->path,
+                   s->match_id);
+
+        // Unbound immediately, so the next countdown can arm it. served_match is
+        // deliberately NOT set here: only a copy that actually lands means this
+        // capture's content has shipped, and until then its own completion must
+        // still be allowed to trim and keep it.
+        s->armed         = 0;
+        s->arm_seq       = -1;
+        s->joined_late   = 0;
+        s->match_id[0]   = '\0';
+        s->final_path[0] = '\0';
+        return;
+    }
+
+    DebugPrint("demo: slot %d could not snapshot %s; closing it for %s instead\n", s->slot, s->path,
+               s->match_id);
+    Demo_Request(s->slot, -1);
+    g_close_pending[s->slot] = 1;
+}
+
+// A Demo_Snapshot copy came back. The capture itself was never interrupted and
+// its segment was handed back at request time; all that settles here is the
+// match's claim, cut out of the copy instead of out of the file.
+static void demo_on_snapshot(const demo_finished_t* done) {
+    demo_pending_snap_t* pend = &g_snap[done->slot];
+    if (pend->seg < 0) {
+        return; // no copy was asked for; nothing this file can do with one.
+    }
+
+    char match_id[64];
+    snprintf(match_id, sizeof(match_id), "%s", pend->match_id);
+
+    if (done->failed || done->discarded) {
+        // The match loses this POV. The capture is left alone on purpose: it is
+        // still recording, may already be armed for the next match, and its own
+        // completion can still trim and keep it (served_match was not set).
+        DebugPrint("demo: slot %d snapshot for %s %s; no POV from this capture\n", done->slot, match_id,
+                   done->discarded ? "held only a gamestate" : "failed");
+        pend->seg = -1;
+        demo_closing_account(match_id);
+        return;
+    }
+
+    demo_finalize_job_t* job = (demo_finalize_job_t*)calloc(1, sizeof(*job));
+    if (!job) {
+        DebugPrint("demo: out of memory finalising %s\n", done->path);
+        unlink(done->path);
+    } else {
+        snprintf(job->raw_path, sizeof(job->raw_path), "%s", done->path);
+        snprintf(job->final_path, sizeof(job->final_path), "%s", pend->final_path);
+        snprintf(job->match_id, sizeof(job->match_id), "%s", match_id);
+        job->seed_at      = pend->seed_at;
+        job->arm_seq      = pend->arm_seq;
+        job->join_lead_ms = pend->join_lead_ms;
+        job->slot         = done->slot;
+        if (demo_finalize_push(job) != 0) {
+            DebugPrint("demo: finalize queue full, leaving %s in place\n", done->path);
+            free(job);
+        }
+    }
+
+    // The capture this came out of has now shipped its content, so when it does
+    // eventually end there is nothing left in it worth keeping. Matched on the
+    // path as well as the index: the record may have been recycled for a
+    // different capture while the copy was being written.
+    demo_seg_t* s = &g_seg[pend->seg];
+    if (s->used && s->slot == done->slot && !strcmp(s->path, pend->capture_path)) {
+        s->served_match = 1;
+    }
+    pend->seg = -1;
+
+    demo_closing_account(match_id);
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points (declared in demo_match.h). Game thread only.
 // ---------------------------------------------------------------------------
@@ -1975,6 +2150,14 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
     }
     demo_cur_init();
 
+    if (done->snapshot) {
+        // A copy of a capture that is STILL recording, not a segment that ended.
+        // Placed by the slot's pending-snapshot record, since done->path names
+        // the copy and demo_seg_find would not match it against any capture.
+        demo_on_snapshot(done);
+        return;
+    }
+
     demo_seg_t* s = demo_seg_find(done->slot, done->path);
     if (!s) {
         return; // a segment we never tracked; upstream's own to keep.
@@ -1982,9 +2165,26 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
     if (g_cur[done->slot] >= 0 && &g_seg[g_cur[done->slot]] == s) {
         g_cur[done->slot] = -1;
     }
+    if (g_snap[done->slot].seg >= 0 && &g_seg[g_snap[done->slot].seg] == s) {
+        // A copy is still owed against a record that is wiped below. Only
+        // reachable when a completion was dropped on overflow - the copy is
+        // queued ahead of the close, so normally it has long since landed - and
+        // leaving it standing would both block this slot's next snapshot and
+        // leave its match waiting out demo_closing_deadlines for nothing.
+        DebugPrint("demo: slot %d snapshot for %s never came back; releasing it\n", done->slot,
+                   g_snap[done->slot].match_id);
+        char lost[64];
+        snprintf(lost, sizeof(lost), "%s", g_snap[done->slot].match_id);
+        g_snap[done->slot].seg = -1;
+        demo_closing_account(lost);
+    }
 
     int armed         = s->armed;
-    int spectated     = !s->armed && s->saw_live;
+    // Already cut and shipped through a snapshot, so what is on disk is the
+    // whole capture, every match in it included. Checked ahead of spectated:
+    // a served capture has saw_live set too, and the two want opposite logs.
+    int served        = !s->armed && s->served_match;
+    int spectated     = !s->armed && !s->served_match && s->saw_live;
     int join_lead_ms  = s->joined_late ? demo_join_lead_ms() : 0;
     char match_id[64];
     snprintf(match_id, sizeof(match_id), "%s", s->match_id);
@@ -2009,6 +2209,17 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
     } else if (armed) {
         DebugPrint("demo: slot %d segment %s %s; nothing to cut for match %s\n", done->slot, done->path,
                    done->discarded ? "held only a gamestate" : "failed in the writer", match_id);
+    } else if (served && !done->discarded && !done->failed && demo_cut_enabled()) {
+        // Every match this capture carried has already been cut out of its own
+        // snapshot and shipped. What is left under this name is the full file -
+        // warmup, both matches, the lot - which is exactly what sv_demoCut
+        // exists not to keep, and trimming it would ship a match twice.
+        if (unlink(done->path) == 0) {
+            DebugPrint("demo: sv_demoCut: slot %d capture %s already shipped as match POVs; removed\n",
+                       done->slot, done->path);
+        } else {
+            DebugPrint("demo: sv_demoCut: could not remove spent capture %s\n", done->path);
+        }
     } else if (spectated && !done->discarded && !done->failed && demo_cut_enabled()) {
         // A live match ran through this capture and its client never entered the
         // game: a spectator's camera follow. Not trimmed and kept like the other
@@ -2051,13 +2262,19 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
     }
 }
 
-// KNOWN LIMITATION, carried forward unchanged from before the v1.0.0 port:
-// back-to-back matches on the same map, with no intervening reconnect or map
-// load, do not produce a fresh gamestate, so the second match records nothing
-// for the players who were already there. This is inherent to the demo format
-// (a valid .dm_91 must start at a gamestate), not a property of this design -
-// the pre-port version had exactly the same hole, for exactly the same reason.
-static void demo_disarm_match(void) {
+// Back-to-back matches on the same map, with no reconnect and no map load in
+// between, used to record nothing for the second one: a valid .dm_91 has to
+// start at a gamestate, ending the match closed the capture, and the map_restart
+// that starts the next match sends no new gamestate for a new capture to begin
+// at. The fix is not to close it. demo_seg_close_for_match takes a copy of the
+// still-open capture instead (Demo_Snapshot), the match is cut out of the copy,
+// and the capture itself runs straight through the restart into the next match,
+// which arms the very same segment record again.
+//
+// keep_capturing says whether the capture has a future worth preserving. A match
+// ending on a live server does; DemoMatch_OnCloseAll does not - there the files
+// are being finalised anyway, so the old close is both correct and cheaper.
+static void demo_disarm_match(int keep_capturing) {
     demo_cur_init();
     if (!g_armed) {
         return;
@@ -2080,14 +2297,13 @@ static void demo_disarm_match(void) {
         }
         outstanding++;
         if (g_cur[s->slot] >= 0 && &g_seg[g_cur[s->slot]] == s) {
-            // -1, not 0: 0 means "follow sv_demoRecord", which is set on any
-            // server this machinery runs on and would leave the segment open
-            // past the end of the match, so its file would never be cut,
-            // indexed or packed. -1 closes it on this client's next outgoing
-            // message, which is this frame or the next; DemoMatch_Frame then
-            // owes upstream the reset back to 0 - see g_close_pending.
-            Demo_Request(s->slot, -1);
-            g_close_pending[s->slot] = 1;
+            if (keep_capturing) {
+                demo_seg_close_for_match(s);
+            } else {
+                // See demo_seg_close_for_match for why -1 and not 0.
+                Demo_Request(s->slot, -1);
+                g_close_pending[s->slot] = 1;
+            }
         }
     }
 
@@ -2134,7 +2350,7 @@ static void demo_arm_match(const char* match_id, const char* map) {
         // Re-arm without an end in between: close a live match out first; an
         // arm that never went live never happened.
         if (g_live) {
-            demo_disarm_match();
+            demo_disarm_match(1);
         } else {
             demo_cancel_match();
         }
@@ -2210,7 +2426,7 @@ void DemoMatch_OnGameEnd(void) {
     if (!g_armed) {
         return;
     }
-    demo_disarm_match();
+    demo_disarm_match(1);
 }
 
 // A countdown that fell apart (player left, ready state lost) before the match
@@ -2232,5 +2448,5 @@ void DemoMatch_OnCloseAll(void) {
         demo_cancel_match();
         return;
     }
-    demo_disarm_match();
+    demo_disarm_match(0);
 }

@@ -156,7 +156,10 @@ static void DrainFinishedDemos(void) {
 
     demo_finished_t done;
     while (Demo_PollFinished(&done)) {
-        if (done.failed) {
+        // A snapshot completion describes a COPY of a capture that is still
+        // recording, so it must not abandon the slot: the only failure it can
+        // report is the copy's, and the capture itself is untouched.
+        if (done.failed && !done.snapshot) {
             Demo_AbandonSlot(done.slot, done.gen);
         }
         // Inert in a nopy build - GameEvents_Frame does not run there, so no
@@ -439,11 +442,16 @@ static void DispatchFinishedDemos(void) {
 
     demo_finished_t done;
     while (Demo_PollFinished(&done)) {
-        if (done.failed) {
+        // See the note in DrainFinishedDemos: a snapshot is a copy of a capture
+        // that is still running, not that capture ending, so neither the abandon
+        // nor the demo_finished event applies to it.
+        if (done.failed && !done.snapshot) {
             Demo_AbandonSlot(done.slot, done.gen);
         }
         DemoMatch_OnFinished(&done);
-        DemoFinishedDispatcher(done.slot, done.path, done.bytes, done.discarded, done.failed);
+        if (!done.snapshot) {
+            DemoFinishedDispatcher(done.slot, done.path, done.bytes, done.discarded, done.failed);
+        }
     }
 
     unsigned dropped = Demo_TakeDroppedCount();
