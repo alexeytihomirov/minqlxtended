@@ -33,6 +33,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <unistd.h>
 
 #include "common.h"
+#include "demo_name.h"
 #include "demos.h"
 #include "profile.h"
 #include "stream.h"
@@ -127,26 +128,6 @@ static cvar_t *fs_homepath;
 
 static const int32_t demo_eof[2] = {-1, -1};
 
-static void demo_sanitise(char *dst, size_t n, const char *src) {
-    size_t j = 0;
-    for (size_t i = 0; src && src[i] && j + 1 < n; i++) {
-        char c = src[i];
-        if (c == '^' && src[i + 1]) { // colour code: skip '^' and the following char.
-            i++;
-            continue;
-        }
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
-            dst[j++] = c;
-        } else if (c == ' ') {
-            dst[j++] = '_';
-        }
-    }
-    if (j == 0) {
-        dst[j++] = 'x';
-    }
-    dst[j] = '\0';
-}
-
 static void demo_mkdir_p(const char *path) {
     char tmp[512];
     snprintf(tmp, sizeof(tmp), "%s", path);
@@ -171,7 +152,7 @@ static void demo_build_name(char *out, size_t n, int slot, client_t *client) {
     }
 
     char name[64];
-    demo_sanitise(name, sizeof(name), client->name);
+    Demo_SanitiseName(name, sizeof(name), client->name);
 
     const char *fmt = (sv_demoNameFormat && sv_demoNameFormat->string[0]) ? sv_demoNameFormat->string
                                                                           : "%date_slot%slot_%name";

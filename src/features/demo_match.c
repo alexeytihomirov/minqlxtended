@@ -112,6 +112,7 @@
 
 #include "common.h"
 #include "features/demo_match.h"
+#include "features/demo_name.h"
 #include "features/demos.h"
 #include "engine/quake_common.h"
 #include "democut/democut.h"
@@ -199,28 +200,11 @@ static cvar_t* sv_demoCutJoinLead;
 // ---------------------------------------------------------------------------
 // Small helpers, ported unchanged from the pre-port demos.c body. They are
 // static there too, so these are separate copies rather than a shared symbol -
-// demos.c stays untouched upstream code.
+// demos.c stays untouched upstream code. The one exception is the name
+// sanitiser, Demo_SanitiseName() in demo_name.c: both files build demo
+// filenames from a player name, and two private copies had already drifted
+// apart on what a name may contain.
 // ---------------------------------------------------------------------------
-
-static void demo_sanitise(char* dst, size_t n, const char* src) {
-    size_t j = 0;
-    for (size_t i = 0; src && src[i] && j + 1 < n; i++) {
-        char c = src[i];
-        if (c == '^' && src[i + 1]) { // colour code: skip '^' and the following char.
-            i++;
-            continue;
-        }
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
-            dst[j++] = c;
-        } else if (c == ' ') {
-            dst[j++] = '_';
-        }
-    }
-    if (j == 0) {
-        dst[j++] = 'x';
-    }
-    dst[j] = '\0';
-}
 
 static void demo_mkdir_p(const char* path) {
     char tmp[DEMO_LONG_PATH];
@@ -244,7 +228,7 @@ static void demo_part_name(char* out, size_t n, const char* path) {
 static void demo_build_pov_name(char* out, size_t n, const char* match_id, const char* map, int slot,
                                 const char* client_name) {
     char name[64];
-    demo_sanitise(name, sizeof(name), client_name);
+    Demo_SanitiseName(name, sizeof(name), client_name);
     snprintf(out, n, "%s_%s_p%d_%s.dm_91", match_id, map, slot, name);
 }
 
@@ -1588,7 +1572,7 @@ static void demo_cvars_ensure(void) {
     // Ours to register: this is a plain sv_-family demo knob (like
     // sv_demoRecord/sv_demoDir, which demos.c owns), not something an operator
     // config line introduces on its own. demos.c itself stays untouched
-    // upstream code (see the comment above demo_sanitise), so it is registered
+    // upstream code (see the comment above demo_mkdir_p), so it is registered
     // from here instead.
     if (!sv_demoCut) {
         sv_demoCut = Cvar_Get("sv_demoCut", "0", CVAR_ARCHIVE);
@@ -2356,8 +2340,8 @@ static void demo_arm_match(const char* match_id, const char* map) {
         }
     }
     demo_cvars_ensure();
-    demo_sanitise(g_match_id, sizeof(g_match_id), match_id);
-    demo_sanitise(g_map, sizeof(g_map), map);
+    Demo_SanitiseName(g_match_id, sizeof(g_match_id), match_id);
+    Demo_SanitiseName(g_map, sizeof(g_map), map);
     demo_finalize_ensure();
     g_armed = 1;
     g_live  = 0;

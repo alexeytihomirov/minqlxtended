@@ -22,7 +22,7 @@ COMMON_SOURCES = src/server/dllmain.c src/server/hooks.c src/server/commands.c \
                  src/server/misc.c src/server/maps_parser.c \
                  src/hook/simple_hook.c src/hook/trampoline.c src/hook/patches.c \
                  src/hook/protect.c \
-                 src/features/demos.c src/features/profile.c \
+                 src/features/demos.c src/features/demo_name.c src/features/profile.c \
                  src/features/demo_match.c src/features/stream.c
 # democut: this repo's own .dm_91 reader/cutter (plain C, gnu11), which
 # src/features/demo_match.c calls for demo_scan()/demo_index()/demo_cut().
