@@ -1651,6 +1651,53 @@ static void stream_publish_serverinfo(int serverid) {
     stream_put(&hdr, info);
 }
 
+// 0 when keyframes are off, else the interval in ms.
+static uint64_t stream_keyframe_ms(void) {
+    if (!sv_demoStreamKeyframeSec) {
+        return 10 * 1000;
+    }
+    if (sv_demoStreamKeyframeSec->integer <= 0) {
+        return 0;
+    }
+    return (uint64_t)cvar_clamped(sv_demoStreamKeyframeSec, 10, 2, 60) * 1000;
+}
+
+// A relay can start a viewer only at a full snapshot. This bounds how far back the last one is by
+// arming the same resync flag a gap does; stream_force_resyncs spends the per-frame budget on it.
+static void stream_arm_keyframes(void) {
+    if (!svs || !svs->clients || !sv_maxclients) {
+        return;
+    }
+    if (sv_demoStreamResync && !sv_demoStreamResync->integer) {
+        return;
+    }
+    uint64_t interval = stream_keyframe_ms();
+    if (interval == 0) {
+        return;
+    }
+    if (!atomic_load_explicit(&stream_link_up, memory_order_relaxed)) {
+        return;
+    }
+    if (stream_shedding) {
+        return; // a full snapshot is the largest message; do not add one while behind
+    }
+    int limit = sv_maxclients->integer;
+    if (limit > MAX_STREAM_CLIENTS) {
+        limit = MAX_STREAM_CLIENTS;
+    }
+    if (limit <= 0) {
+        return;
+    }
+
+    uint64_t now = stream_now_ms();
+    for (int slot = 0; slot < limit; slot++) {
+        if (stream_active[slot] && !stream_resync_pending[slot] &&
+            now - stream_last_full_ms[slot] >= interval) {
+            stream_resync_pending[slot] = 1;
+        }
+    }
+}
+
 // A forced full snapshot means a fragmented message and a visible pause for that client. Doing
 // every client at once hitches the whole server, so one per frame by default.
 static void stream_force_resyncs(void) {
@@ -1737,6 +1784,7 @@ void Stream_Frame(void) {
     }
 
     stream_publish_guid(serverid);
+    stream_arm_keyframes();
     stream_force_resyncs();
 }
 
