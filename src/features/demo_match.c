@@ -197,6 +197,11 @@ static cvar_t* sv_demoCutJoinLead;
 #define DEMO_JOIN_LEAD_DEFAULT_S 15
 #define DEMO_JOIN_LEAD_MAX_S     600
 
+// CS_MATCH_GUID as stored here: a 36-character lower-case UUID plus its NUL,
+// rounded up. See demo_match_guid_read for what counts as valid.
+#define DEMO_MATCH_GUID_LEN  36
+#define DEMO_MATCH_GUID_SIZE 40
+
 // ---------------------------------------------------------------------------
 // Small helpers, ported unchanged from the pre-port demos.c body. They are
 // static there too, so these are separate copies rather than a shared symbol -
@@ -280,6 +285,11 @@ typedef struct {
     int join_lead_ms;   // how far before arm_seq the window may open; 0 normally
     int slot;
     int last_for_match; // terminal marker: no file, just "this match is done"
+    // Who and which game, for the snapshot index. Both were read on the game
+    // thread (demo_seg_arm, demo_match_guid_capture) and are only printed by the
+    // finalize thread. 0 / "" = unknown, and the index then omits the key.
+    uint64_t steam_id;
+    char match_guid[DEMO_MATCH_GUID_SIZE];
     // sv_demoCut job: raw_path is the only field that matters (final_path and
     // match_id are left empty). Handled by demo_trim_only() before this job
     // would otherwise touch g_fin_acc/match_id at all - see the dispatch in
@@ -327,6 +337,10 @@ typedef struct {
     // normal and common: see demo_scan's live_ms contract. Published as
     // game_start_server_time in this POV's snapshot index.
     int live_ms;
+    // Copied from the job; see demo_finalize_job_t. Published as steam_id64 and
+    // match_guid in this POV's snapshot index, omitted when 0 / "".
+    uint64_t steam_id;
+    char match_guid[DEMO_MATCH_GUID_SIZE];
     // Snapshot range read back out of the SHIPPED file after a successful
     // stage-2 cut, or -1/-1 when this POV was not stage-2 cut (or the re-scan
     // failed). Used only by the post-cut alignment check in
@@ -602,12 +616,20 @@ static void demo_stage_sweep(void) {
 // why this runs at the two places a POV reaches its final form
 // (demo_pov_publish, and the post-rename step of demo_stage2_flush's pass 3)
 // and nowhere earlier.
+//
+// Keys, in order: file, client_num, steam_id64 (17-digit string, omitted for a
+// bot or an unknown id), match_guid (lower-case UUID from CS_MATCH_GUID,
+// omitted when none was read), first_server_time, last_server_time,
+// game_start_server_time, index_framing, snapshots. The two optional keys are
+// read on the game thread and only printed here; a consumer must treat their
+// absence as "unknown", never as an error.
 // ---------------------------------------------------------------------------
 
 // No JSON library is vendored and this file emits exactly one shape of
 // document, so the serialiser is these ~40 lines rather than a dependency.
-// Numbers are printed with snprintf and need no escaping at all; only the two
-// string values (a file path and a fixed literal) go through here.
+// Numbers are printed with snprintf and need no escaping at all; only the
+// string values (a file path, the steam id, the match guid and a fixed literal)
+// go through here.
 static void demo_json_str(FILE* f, const char* s) {
     fputc('"', f);
     for (const unsigned char* p = (const unsigned char*)s; p && *p; p++) {
@@ -777,6 +799,23 @@ static int demo_write_index(const demo_pov_t* p, demo_scan_t* out_scan) {
         demo_json_str(f, rel);
     }
     fprintf(f, ",\n  \"client_num\": %d,\n", client_num);
+    // Who played this POV and which game it was, both strings so a consumer
+    // never has to trust a JSON number with 64 bits. Omitted when unknown: a
+    // bot's steam id is 0, and CS_MATCH_GUID may never have held a valid UUID.
+    if (p->steam_id) {
+        char sid[24];
+        int n = snprintf(sid, sizeof(sid), "%llu", (unsigned long long)p->steam_id);
+        if (n == 17) {
+            fputs("  \"steam_id64\": ", f);
+            demo_json_str(f, sid);
+            fputs(",\n", f);
+        }
+    }
+    if (p->match_guid[0]) {
+        fputs("  \"match_guid\": ", f);
+        demo_json_str(f, p->match_guid);
+        fputs(",\n", f);
+    }
     fprintf(f, "  \"first_server_time\": %d,\n", idx.scan.first_ms);
     fprintf(f, "  \"last_server_time\": %d,\n", idx.scan.last_ms);
     fprintf(f, "  \"game_start_server_time\": %d,\n", p->live_ms);
@@ -1141,6 +1180,8 @@ static void demo_stage1(const demo_finalize_job_t* job) {
     p->shipped_last_ms  = -1;
     p->live_ms          = -1;
     p->slot             = job->slot;
+    p->steam_id         = job->steam_id;
+    snprintf(p->match_guid, sizeof(p->match_guid), "%s", job->match_guid);
     snprintf(p->final_path, sizeof(p->final_path), "%s", job->final_path);
     snprintf(p->source, sizeof(p->source), "%s", job->raw_path);
     g_fin_acc.count++;
@@ -1462,6 +1503,11 @@ typedef struct {
     int32_t arm_seq; // netchan outgoingSequence at the arm instant, -1 if none
     int slot;
     int armed; // 1 once bound to a match_id
+    // Read at the arm instant (svs->clients[slot].steam_id; 0 for a bot) and
+    // the match's CS_MATCH_GUID as known so far - demo_match_guid_capture fills
+    // it in for every armed segment once the game goes live. Game thread only.
+    uint64_t steam_id;
+    char match_guid[DEMO_MATCH_GUID_SIZE];
     // Bound at a mid-match join rather than at the countdown, so its shipped POV
     // starts sv_demoCutJoinLead seconds before arm_seq instead of at it.
     int joined_late;
@@ -1513,6 +1559,8 @@ typedef struct {
     time_t seed_at;
     int32_t arm_seq;
     int join_lead_ms;
+    uint64_t steam_id;
+    char match_guid[DEMO_MATCH_GUID_SIZE];
 } demo_pending_snap_t;
 static demo_pending_snap_t g_snap[MAX_DEMO_CLIENTS];
 
@@ -1528,6 +1576,13 @@ static int g_armed;
 static int g_live;
 static char g_match_id[64];
 static char g_map[64];
+// The armed match's CS_MATCH_GUID, lower-case, or "" until a valid one is read.
+// See demo_match_guid_capture.
+static char g_match_guid[DEMO_MATCH_GUID_SIZE];
+// The guid the last finished match carried, kept across the disarm. A
+// CS_MATCH_GUID equal to it is the previous game's still in the configstring,
+// not this one's - see demo_match_guid_capture.
+static char g_prev_match_guid[DEMO_MATCH_GUID_SIZE];
 static uint32_t g_seg_seq; // ever-increasing per-segment discriminator
 
 // A match that has been disarmed but whose segments have not all come back
@@ -1724,7 +1779,9 @@ static void demo_seg_arm(demo_seg_t* s) {
         return;
     }
     snprintf(s->match_id, sizeof(s->match_id), "%s", g_match_id);
-    s->arm_seq = demo_slot_seq(s->slot);
+    s->arm_seq  = demo_slot_seq(s->slot);
+    s->steam_id = demo_slot_connected(s->slot) ? svs->clients[s->slot].steam_id : 0;
+    snprintf(s->match_guid, sizeof(s->match_guid), "%s", g_match_guid);
 
     const char* name = demo_slot_connected(s->slot) ? svs->clients[s->slot].name : "";
     demo_seg_build_final(s, name);
@@ -1996,6 +2053,8 @@ static void demo_seg_close_for_match(demo_seg_t* s) {
         pend->seed_at      = s->seed_at;
         pend->arm_seq      = s->arm_seq;
         pend->join_lead_ms = s->joined_late ? demo_join_lead_ms() : 0;
+        pend->steam_id     = s->steam_id;
+        snprintf(pend->match_guid, sizeof(pend->match_guid), "%s", s->match_guid);
         snprintf(pend->capture_path, sizeof(pend->capture_path), "%.*s", (int)sizeof(s->path) - 1, s->path);
         snprintf(pend->final_path, sizeof(pend->final_path), "%s", s->final_path);
         snprintf(pend->match_id, sizeof(pend->match_id), "%s", s->match_id);
@@ -2056,6 +2115,8 @@ static void demo_on_snapshot(const demo_finished_t* done) {
         job->arm_seq      = pend->arm_seq;
         job->join_lead_ms = pend->join_lead_ms;
         job->slot         = done->slot;
+        job->steam_id     = pend->steam_id;
+        snprintf(job->match_guid, sizeof(job->match_guid), "%s", pend->match_guid);
         if (demo_finalize_push(job) != 0) {
             DebugPrint("demo: finalize queue full, leaving %s in place\n", done->path);
             free(job);
@@ -2185,6 +2246,8 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
             job->arm_seq      = s->arm_seq;
             job->join_lead_ms = join_lead_ms;
             job->slot         = done->slot;
+            job->steam_id     = s->steam_id;
+            snprintf(job->match_guid, sizeof(job->match_guid), "%s", s->match_guid);
             if (demo_finalize_push(job) != 0) {
                 DebugPrint("demo: finalize queue full, leaving %s in place\n", done->path);
                 free(job);
@@ -2266,10 +2329,14 @@ static void demo_disarm_match(int keep_capturing) {
     char match_id[64];
     snprintf(match_id, sizeof(match_id), "%s", g_match_id);
 
-    g_armed       = 0;
-    g_live        = 0;
-    g_match_id[0] = '\0';
-    g_map[0]      = '\0';
+    if (g_match_guid[0]) {
+        snprintf(g_prev_match_guid, sizeof(g_prev_match_guid), "%s", g_match_guid);
+    }
+    g_armed         = 0;
+    g_live          = 0;
+    g_match_id[0]   = '\0';
+    g_map[0]        = '\0';
+    g_match_guid[0] = '\0';
 
     // Every segment of this match that has not already come back through the
     // completion queue, whether it is still open or merely still in flight.
@@ -2322,10 +2389,11 @@ static void demo_cancel_match(void) {
         unbound++;
     }
     DebugPrint("demo: match %s cancelled before going live; %d segment(s) unbound\n", g_match_id, unbound);
-    g_armed       = 0;
-    g_live        = 0;
-    g_match_id[0] = '\0';
-    g_map[0]      = '\0';
+    g_armed         = 0;
+    g_live          = 0;
+    g_match_id[0]   = '\0';
+    g_map[0]        = '\0';
+    g_match_guid[0] = '\0';
 }
 
 static void demo_arm_match(const char* match_id, const char* map) {
@@ -2343,8 +2411,9 @@ static void demo_arm_match(const char* match_id, const char* map) {
     Demo_SanitiseName(g_match_id, sizeof(g_match_id), match_id);
     Demo_SanitiseName(g_map, sizeof(g_map), map);
     demo_finalize_ensure();
-    g_armed = 1;
-    g_live  = 0;
+    g_armed         = 1;
+    g_live          = 0;
+    g_match_guid[0] = '\0'; // read at game_start; see demo_match_guid_capture
 
     if (!svs || !svs->clients) {
         DebugPrint("demo: armed %s on %s (engine not ready; slots bind as they open)\n", g_match_id, g_map);
@@ -2371,6 +2440,84 @@ static void demo_arm_match(const char* match_id, const char* map) {
     DebugPrint("demo: armed %s on %s\n", g_match_id, g_map);
 }
 
+// CS_MATCH_GUID, lower-cased, into out (DEMO_MATCH_GUID_SIZE bytes). Returns 1
+// for a well-formed UUID (8-4-4-4-12 hex digits), 0 with out = "" for anything
+// else, an empty configstring included. Game thread only: it reads
+// sv.configstrings. raw receives what the configstring actually held, for the
+// log line of a caller that got 0.
+static int demo_match_guid_read(char* out, char* raw, size_t raw_len) {
+    out[0] = '\0';
+    raw[0] = '\0';
+    if (!SV_GetConfigstring) {
+        return 0;
+    }
+    SV_GetConfigstring(CS_MATCH_GUID, raw, (int)raw_len);
+    if (strlen(raw) != DEMO_MATCH_GUID_LEN) {
+        return 0;
+    }
+    char guid[DEMO_MATCH_GUID_SIZE];
+    for (int i = 0; i < DEMO_MATCH_GUID_LEN; i++) {
+        char c = raw[i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (c != '-') {
+                return 0;
+            }
+        } else if (c >= 'A' && c <= 'F') {
+            c = (char)(c - 'A' + 'a');
+        } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return 0;
+        }
+        guid[i] = c;
+    }
+    guid[DEMO_MATCH_GUID_LEN] = '\0';
+    snprintf(out, DEMO_MATCH_GUID_SIZE, "%s", guid);
+    return 1;
+}
+
+// Ties the armed match to the engine's own game id, for the snapshot index.
+// Read at game_start and again at game_end because when the engine sets
+// CS_MATCH_GUID relative to those two crossings is not established; a valid
+// value read later replaces an earlier different one (logged), so the guid
+// stored is the one the game ended with - the same one the telemetry plugin
+// reads at match_end. A value equal to the previous finished game's is that
+// game's guid still in the configstring and is not written. Copied into every
+// segment still armed for the match; demo_seg_arm copies it into any that arm
+// later. Game thread only - the finalize thread sees the value only through its
+// jobs.
+static void demo_match_guid_capture(const char* when) {
+    if (!g_armed) {
+        return;
+    }
+    char guid[DEMO_MATCH_GUID_SIZE];
+    char raw[128];
+    if (!demo_match_guid_read(guid, raw, sizeof(raw))) {
+        if (raw[0]) {
+            DebugPrint("demo: %s CS_MATCH_GUID at %s is not a UUID (\"%s\"); ignored\n", g_match_id, when, raw);
+        } else if (!g_match_guid[0]) {
+            DebugPrint("demo: %s has no CS_MATCH_GUID at %s\n", g_match_id, when);
+        }
+        return;
+    }
+    if (g_prev_match_guid[0] && !strcmp(g_prev_match_guid, guid)) {
+        DebugPrint("demo: CS_MATCH_GUID %s equals the previous game's; not written\n", guid);
+        return;
+    }
+    if (g_match_guid[0]) {
+        if (!strcmp(g_match_guid, guid)) {
+            return;
+        }
+        DebugPrint("demo: %s CS_MATCH_GUID changed by %s: was %s, now %s\n", g_match_id, when, g_match_guid, guid);
+    }
+    snprintf(g_match_guid, sizeof(g_match_guid), "%s", guid);
+    for (int i = 0; i < DEMO_MAX_PENDING; i++) {
+        demo_seg_t* s = &g_seg[i];
+        if (s->used && s->armed && !strcmp(s->match_id, g_match_id)) {
+            snprintf(s->match_guid, sizeof(s->match_guid), "%s", g_match_guid);
+        }
+    }
+    DebugPrint("demo: %s is match_guid %s (read at %s)\n", g_match_id, g_match_guid, when);
+}
+
 // The countdown is the moment the match's identity is fixed and its segments
 // bind - the shipped files start here (stage 1 cuts at the arm instant).
 void DemoMatch_OnGameCountdown(void) {
@@ -2391,6 +2538,7 @@ void DemoMatch_OnGameCountdown(void) {
 void DemoMatch_OnGameStart(void) {
     if (g_armed) {
         g_live = 1;
+        demo_match_guid_capture("game_start");
         return;
     }
     if (!demo_cut_enabled() || !demo_upstream_records()) {
@@ -2402,6 +2550,7 @@ void DemoMatch_OnGameStart(void) {
     const char* map = (mapname && mapname->string[0]) ? mapname->string : "unknown";
     demo_arm_match(match_id, map);
     g_live = 1;
+    demo_match_guid_capture("game_start");
 }
 
 // Both engine paths to a match ending land here: intermission queued, and a
@@ -2410,6 +2559,8 @@ void DemoMatch_OnGameEnd(void) {
     if (!g_armed) {
         return;
     }
+    // Before the disarm, so the snapshot taken there still carries the guid.
+    demo_match_guid_capture("game_end");
     demo_disarm_match(1);
 }
 
