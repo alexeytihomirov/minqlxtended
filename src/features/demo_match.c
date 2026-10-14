@@ -1579,6 +1579,10 @@ static char g_map[64];
 // The armed match's CS_MATCH_GUID, lower-case, or "" until a valid one is read.
 // See demo_match_guid_capture.
 static char g_match_guid[DEMO_MATCH_GUID_SIZE];
+// The guid the last finished match carried, kept across the disarm. A
+// CS_MATCH_GUID equal to it is the previous game's still in the configstring,
+// not this one's - see demo_match_guid_capture.
+static char g_prev_match_guid[DEMO_MATCH_GUID_SIZE];
 static uint32_t g_seg_seq; // ever-increasing per-segment discriminator
 
 // A match that has been disarmed but whose segments have not all come back
@@ -2325,6 +2329,9 @@ static void demo_disarm_match(int keep_capturing) {
     char match_id[64];
     snprintf(match_id, sizeof(match_id), "%s", g_match_id);
 
+    if (g_match_guid[0]) {
+        snprintf(g_prev_match_guid, sizeof(g_prev_match_guid), "%s", g_match_guid);
+    }
     g_armed         = 0;
     g_live          = 0;
     g_match_id[0]   = '\0';
@@ -2469,11 +2476,14 @@ static int demo_match_guid_read(char* out, char* raw, size_t raw_len) {
 
 // Ties the armed match to the engine's own game id, for the snapshot index.
 // Read at game_start and again at game_end because when the engine sets
-// CS_MATCH_GUID relative to those two crossings is not established; the first
-// valid value wins, and a later different one is logged rather than applied, so
-// every POV of one match carries the same guid. Copied into every segment
-// already armed for the match; demo_seg_arm copies it into any that arm later.
-// Game thread only - the finalize thread sees the value only through its jobs.
+// CS_MATCH_GUID relative to those two crossings is not established; a valid
+// value read later replaces an earlier different one (logged), so the guid
+// stored is the one the game ended with - the same one the telemetry plugin
+// reads at match_end. A value equal to the previous finished game's is that
+// game's guid still in the configstring and is not written. Copied into every
+// segment still armed for the match; demo_seg_arm copies it into any that arm
+// later. Game thread only - the finalize thread sees the value only through its
+// jobs.
 static void demo_match_guid_capture(const char* when) {
     if (!g_armed) {
         return;
@@ -2488,12 +2498,15 @@ static void demo_match_guid_capture(const char* when) {
         }
         return;
     }
-    if (g_match_guid[0]) {
-        if (strcmp(g_match_guid, guid) != 0) {
-            DebugPrint("demo: %s CS_MATCH_GUID changed by %s: keeping %s, now %s\n", g_match_id, when, g_match_guid,
-                       guid);
-        }
+    if (g_prev_match_guid[0] && !strcmp(g_prev_match_guid, guid)) {
+        DebugPrint("demo: CS_MATCH_GUID %s equals the previous game's; not written\n", guid);
         return;
+    }
+    if (g_match_guid[0]) {
+        if (!strcmp(g_match_guid, guid)) {
+            return;
+        }
+        DebugPrint("demo: %s CS_MATCH_GUID changed by %s: was %s, now %s\n", g_match_id, when, g_match_guid, guid);
     }
     snprintf(g_match_guid, sizeof(g_match_guid), "%s", guid);
     for (int i = 0; i < DEMO_MAX_PENDING; i++) {
