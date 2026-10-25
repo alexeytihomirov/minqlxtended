@@ -37,6 +37,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "engine/patterns.h"
 #include "features/profile.h"
 #include "engine/quake_common.h"
+#include "features/rcon_send.h"
 #include "features/reliable.h"
 #include "features/scoreboard.h"
 #include "features/stream.h"
@@ -679,6 +680,8 @@ void __cdecl My_G_RunFrame(int time) {
         PROF_BEGIN(t_stream);
         Stream_Frame();
         PROF_END(PROF_STREAM_FRAME, t_stream);
+
+        RconSend_Frame();
     }
 
     G_RunFrame(time);
