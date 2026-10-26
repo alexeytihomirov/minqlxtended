@@ -677,6 +677,13 @@ static PyObject* PyMinqlxtended_PlayerInfo(PyObject* self, PyObject* args) {
         return NULL;
     }
 
+    // makePlayerTuple reads g_entities, which My_G_ShutdownGame NULLs before the game's own
+    // shutdown runs. That shutdown still executes bot client commands, so a client_command
+    // handler building a Player gets here with no game module.
+    if (!qlx_vm_ready()) {
+        return NULL;
+    }
+
     if (allow_free_client != i && svs->clients[i].state == CS_FREE) {
 #ifndef NDEBUG
         DebugPrint("WARNING: PyMinqlxtended_PlayerInfo called for CS_FREE client %d.\n", i);
