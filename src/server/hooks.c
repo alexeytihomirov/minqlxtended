@@ -303,7 +303,10 @@ void __cdecl My_SV_UpdateUserinfo_f(client_t* cl) {
 
 void __cdecl My_SV_ExecuteClientCommand(client_t* cl, char* s, qboolean clientOK) {
     char* res = s;
-    if (clientOK && cl->gentity) {
+    // No dispatch while the game module is going away: G_ShutdownGame still runs bot client
+    // commands after My_G_ShutdownGame has NULLed g_entities, and every handler builds a
+    // Player from it. See vm_rehooking in common.h.
+    if (clientOK && cl->gentity && !atomic_load_explicit(&vm_rehooking, memory_order_acquire)) {
         res = ClientCommandDispatcher(cl - svs->clients, s);
         if (!res) {
             return;
