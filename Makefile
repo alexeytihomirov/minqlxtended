@@ -37,7 +37,7 @@ COMMON_SOURCES += src/democut/democut.c \
 SOURCES_NOPY += $(COMMON_SOURCES)
 SOURCES += $(COMMON_SOURCES) \
            src/features/reliable.c src/features/scoreboard.c src/features/game_events.c \
-           src/features/console_command.c \
+           src/features/console_command.c src/features/splash_bend.c \
            src/python/python_embed.c src/python/python_dispatchers.c src/python/python_objects.c
 
 # One object directory per target. The four sets of flags differ, and a shared directory
