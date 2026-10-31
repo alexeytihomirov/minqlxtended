@@ -41,6 +41,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "features/rcon_send.h"
 #include "features/reliable.h"
 #include "features/scoreboard.h"
+#include "features/splash_bend.h"
 #include "features/stream.h"
 #include "hook/simple_hook.h"
 
@@ -955,6 +956,8 @@ void HookVm(void) {
             count++;
         }
     }
+
+    count += SplashBend_Hook(); // tolerated as well; counts what it installed
 
     if (failed) {
         DebugPrint("Exiting.\n");

@@ -40,6 +40,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "features/rcon_send.h"
 #include "features/reliable.h"
 #include "features/scoreboard.h"
+#include "features/splash_bend.h"
 #include "features/stream.h"
 #include "maps_parser.h"
 
@@ -466,6 +467,11 @@ void SearchVmFunctions(void) {
         DebugPrint("RespawnItem: %p\n", RespawnItem);
     }
 
+#ifndef NOPY
+    // Tolerated: splash stays stock. The hooks go in from HookVm, which a Python build runs.
+    SplashBend_Resolve();
+#endif
+
     if (failed) {
         DebugPrint("Exiting.\n");
         exit(1);
@@ -493,6 +499,7 @@ void InitializeStatic(void) {
     // the guard: Demo_Capture and G_RunFrame are both hooked either way.
     Cmd_AddCommand("qlx_reliable", ReliableCommand);
     Cmd_AddCommand("qlx_scoreboard", ScoreboardCommand);
+    Cmd_AddCommand("qlx_splashbend", SplashBend_Command);
     Cmd_AddCommand("qlx_pyperf", PyPerfCommand);
     Cmd_AddCommand("qlx", PyRcon);
     Cmd_AddCommand("pycmd", PyPrefixCommand);
