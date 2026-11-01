@@ -10,9 +10,10 @@ void SplashBend_Resolve(void);
 // Installs the two hooks, from HookVm. Returns how many went in, which HookVm has to count.
 int SplashBend_Hook(void);
 
-// From My_G_Damage, either side of G_Damage: the damage a bent blast deals, and the kick it leaves.
-int SplashBend_ScaleDamage(gentity_t *targ, int damage);
-void SplashBend_ScaleKnockback(gentity_t *targ);
+// From My_G_Damage, either side of G_Damage. Sets what G_Damage is to be given and returns the
+// damage it will deal, which for a rocket splash is not the same thing.
+int SplashBend_ScaleDamage(gentity_t *targ, int mod, int *damage);
+void SplashBend_EndDamage(void);
 
 // qlx_splashbend [0|1|reset]
 void SplashBend_Command(void);

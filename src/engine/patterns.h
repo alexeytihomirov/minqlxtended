@@ -163,6 +163,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // The disp32 of `mov r14, [rip+...]` in CanDamage, and where gi.trace sits in the table it loads.
 #define RELOFFSET_RELP_GI_CANDAMAGE 0x1D
 #define RELOFFSET_GI_TRACE 0x100
+#define RELOFFSET_LOAD_SPLASHDAMAGE_RL 0xCE9
+#define VMCVAR_INTEGER 0xC
 
 // Functions without patterns.
 #define OFFSET_RELP_CMD_ARGC ((pint)SV_Map_f + 0x81)
