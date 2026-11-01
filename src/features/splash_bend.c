@@ -18,12 +18,14 @@
 // A bent blast is weaker, by qlx_splashBendDamage and qlx_splashBendKnockback. G_Damage works the
 // damage of a rocket splash out again from g_splashdamage_rl and the distance, and uses what it is
 // given only for the knockback. So the argument scales the knockback, and the cvar is scaled for
-// the length of the call.
+// the length of the call. qlx_splashBendFalloff is the power of (1 - distance / radius) in both:
+// stock is 1, so at 2 a bent blast fades faster with distance than a straight one.
 //
 // Rockets only. CanDamage is not told what exploded, so the G_RadiusDamage hook notes it.
 // G_RadiusDamage is the common path; the variant for surfaces a rocket splashes through
 // (g_dmgThroughSurface*) is left alone. Game thread only, like everything that reaches here.
 
+#include <math.h>
 #include <string.h>
 
 #include "common.h"
@@ -36,6 +38,8 @@
 #define SPLASH_CONTENTS_SOLID 1
 #define SPLASH_DISTANCE_MIN 8
 #define SPLASH_DISTANCE_MAX 64
+#define SPLASH_FALLOFF_MIN 1.0f
+#define SPLASH_FALLOFF_MAX 4.0f
 // A ray stopped this short by the surface next to the explosion shows nothing new.
 #define SPLASH_RAY_MIN 4.0f
 // Kept off whatever stopped the ray, so the next trace does not start inside it.
@@ -78,6 +82,7 @@ static cvar_t *qlx_splashBend;
 static cvar_t *qlx_splashBendDistance;
 static cvar_t *qlx_splashBendDamage;
 static cvar_t *qlx_splashBendKnockback;
+static cvar_t *qlx_splashBendFalloff;
 
 static int in_rocket;
 static const vec_t *rocket_normal; // of the surface hit; NULL if the game gave none
@@ -103,8 +108,9 @@ static void splash_cvars(void) {
     if (Cvar_Get && !qlx_splashBend) {
         qlx_splashBend          = Cvar_Get("qlx_splashBend", "0", CVAR_ARCHIVE);
         qlx_splashBendDistance  = Cvar_Get("qlx_splashBendDistance", "24", CVAR_ARCHIVE);
-        qlx_splashBendDamage    = Cvar_Get("qlx_splashBendDamage", "0.5", CVAR_ARCHIVE);
-        qlx_splashBendKnockback = Cvar_Get("qlx_splashBendKnockback", "0.5", CVAR_ARCHIVE);
+        qlx_splashBendDamage    = Cvar_Get("qlx_splashBendDamage", "1", CVAR_ARCHIVE);
+        qlx_splashBendKnockback = Cvar_Get("qlx_splashBendKnockback", "1", CVAR_ARCHIVE);
+        qlx_splashBendFalloff   = Cvar_Get("qlx_splashBendFalloff", "2", CVAR_ARCHIVE);
     }
 }
 
@@ -120,6 +126,13 @@ static float splash_fraction(const cvar_t *cvar) {
         return 0.0f;
     }
     return cvar->value > 1.0f ? 1.0f : cvar->value;
+}
+
+static float splash_falloff(void) {
+    if (qlx_splashBendFalloff->value < SPLASH_FALLOFF_MIN) {
+        return SPLASH_FALLOFF_MIN;
+    }
+    return qlx_splashBendFalloff->value > SPLASH_FALLOFF_MAX ? SPLASH_FALLOFF_MAX : qlx_splashBendFalloff->value;
 }
 
 static qboolean splash_behind_slab(gentity_t *targ, const vec_t *origin) {
@@ -238,14 +251,22 @@ int SplashBend_ScaleDamage(gentity_t *targ, int mod, int *damage) {
     }
     bent_target = NULL;
 
-    float rate = splash_fraction(qlx_splashBendDamage);
+    // The stock falloff is already in what G_Damage is given and in what it works out, so only the
+    // power above 1 is added. Without the cvar's value the distance is unknown, and it stays stock.
+    float fade = 1.0f;
+    if (mod == SPLASH_MOD_ROCKET_SPLASH && splash_damage_rl && *splash_damage_rl > 0) {
+        float near = (float)given / *splash_damage_rl;
+        fade       = powf(near > 1.0f ? 1.0f : near, splash_falloff() - 1.0f);
+    }
+
+    float rate = splash_fraction(qlx_splashBendDamage) * fade;
     int dealt  = (int)(given * rate + 0.5f);
 
     if (mod == SPLASH_MOD_ROCKET_SPLASH && splash_damage_rl) {
         splash_damage_saved  = *splash_damage_rl;
         splash_damage_scaled = 1;
         *splash_damage_rl    = (int)(splash_damage_saved * rate + 0.5f);
-        *damage              = (int)(given * splash_fraction(qlx_splashBendKnockback) + 0.5f);
+        *damage              = (int)(given * splash_fraction(qlx_splashBendKnockback) * fade + 0.5f);
     } else {
         *damage = dealt;
     }
@@ -348,11 +369,12 @@ void SplashBend_Command(void) {
         }
     }
 
-    ENGINE_PRINTF("qlx_splashBend %d, distance %d, damage %.3f, knockback %.3f, %s%s\n",
+    ENGINE_PRINTF("qlx_splashBend %d, distance %d, damage %.3f, knockback %.3f, falloff %.2f, %s%s\n",
                   qlx_splashBend ? qlx_splashBend->integer : 0,
                   qlx_splashBendDistance ? (int)splash_distance() : 0,
                   qlx_splashBendDamage ? splash_fraction(qlx_splashBendDamage) : 0.0f,
                   qlx_splashBendKnockback ? splash_fraction(qlx_splashBendKnockback) : 0.0f,
+                  qlx_splashBendFalloff ? splash_falloff() : 0.0f,
                   trace_table ? "hooks found" : "HOOKS NOT FOUND, stock splash",
                   splash_damage_rl ? "" : ", DAMAGE NOT SCALED");
     ENGINE_PRINTF("rockets %u, players refused by stock %u, behind a slab %u, let through by the bend %u, rays %u\n",
