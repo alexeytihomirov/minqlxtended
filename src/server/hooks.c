@@ -638,7 +638,9 @@ void __cdecl My_FireWeapon(gentity_t* ent) {
 // victim's health is what they were left with.
 void __cdecl My_G_Damage(gentity_t* targ, gentity_t* inflictor, gentity_t* attacker,
                          vec3_t dir, vec3_t point, int damage, int dflags, int mod) {
+    damage = SplashBend_ScaleDamage(targ, damage);
     G_Damage(targ, inflictor, attacker, dir, point, damage, dflags, mod);
+    SplashBend_ScaleKnockback(targ);
 
     // Doors and other shootable brushes take damage constantly and aren't what anyone
     // hooks this for, so players only.

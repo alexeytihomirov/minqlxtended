@@ -8,9 +8,15 @@
 // With qlx_splashBend on, a player CanDamage refused gets a second chance: rays go out from the
 // explosion, up to qlx_splashBendDistance units, and CanDamage is asked again from where each one
 // ends. So the blast may turn one corner, and it never passes through anything, since both legs of
-// the path are traced against the world. What stock lets through is not touched, nor is the
-// damage: G_RadiusDamage still works it out from the real explosion and the straight distance.
-// With the default distance that is what the path measures anyway, give or take a unit on a stair.
+// the path are traced against the world. What stock lets through is not touched.
+//
+// A slab is refused: tracing from the player back to the explosion stops on the obstacle's face
+// towards the player, and if that face looks away from the surface the rocket hit, the blast would
+// have to come out on the far side of the obstacle, through a hole in a platform or around the end
+// of a wall. On a stair the two faces are at a right angle.
+//
+// A bent blast is weaker: qlx_splashBendDamage and qlx_splashBendKnockback scale what G_Damage is
+// given and the kick it leaves in the player's velocity.
 //
 // Rockets only. CanDamage is not told what exploded, so the G_RadiusDamage hook notes it.
 // G_RadiusDamage is the common path; the variant for surfaces a rocket splashes through
@@ -32,6 +38,10 @@
 #define SPLASH_RAY_MIN 4.0f
 // Kept off whatever stopped the ray, so the next trace does not start inside it.
 #define SPLASH_RAY_BACKOFF 1.0f
+// CanDamage's test points, to the sides of the target's centre.
+#define SPLASH_TARGET_SPREAD 15.0f
+// Hit surface against the obstacle's face towards the player: 0 is a right angle, -1 a flat slab.
+#define SPLASH_OPPOSED_FACES -0.5f
 
 #define D1 1.0f
 #define D2 0.70710678f
@@ -62,21 +72,75 @@ static pint *trace_table; // qagame's pointer to the engine's import table; fill
 
 static cvar_t *qlx_splashBend;
 static cvar_t *qlx_splashBendDistance;
+static cvar_t *qlx_splashBendDamage;
+static cvar_t *qlx_splashBendKnockback;
 
 static int in_rocket;
+static const vec_t *rocket_normal; // of the surface hit; NULL if the game gave none
+static gentity_t *bent_target;     // CanDamage needed the bend for this one, in this explosion
+
+static gentity_t *kick_target; // between SplashBend_ScaleDamage and SplashBend_ScaleKnockback
+static float kick_scale;
+static vec3_t kick_velocity;
 
 static struct {
     unsigned explosions; // rockets through G_RadiusDamage
     unsigned refused;    // players CanDamage refused during those
+    unsigned opposed;    // ...of them, behind a slab
     unsigned bent;       // ...and how many of them the bend let through
     unsigned rays;
 } splash_stats;
 
 static void splash_cvars(void) {
     if (Cvar_Get && !qlx_splashBend) {
-        qlx_splashBend         = Cvar_Get("qlx_splashBend", "0", CVAR_ARCHIVE);
-        qlx_splashBendDistance = Cvar_Get("qlx_splashBendDistance", "24", CVAR_ARCHIVE);
+        qlx_splashBend          = Cvar_Get("qlx_splashBend", "0", CVAR_ARCHIVE);
+        qlx_splashBendDistance  = Cvar_Get("qlx_splashBendDistance", "24", CVAR_ARCHIVE);
+        qlx_splashBendDamage    = Cvar_Get("qlx_splashBendDamage", "0.5", CVAR_ARCHIVE);
+        qlx_splashBendKnockback = Cvar_Get("qlx_splashBendKnockback", "0.5", CVAR_ARCHIVE);
     }
+}
+
+static float splash_fraction(const cvar_t *cvar) {
+    if (cvar->value < 0.0f) {
+        return 0.0f;
+    }
+    return cvar->value > 1.0f ? 1.0f : cvar->value;
+}
+
+static qboolean splash_behind_slab(gentity_t *targ, const vec_t *origin) {
+    static const vec3_t zero       = {0, 0, 0};
+    static const float sides[5][2] = {
+        {0, 0},
+        {SPLASH_TARGET_SPREAD, SPLASH_TARGET_SPREAD},
+        {SPLASH_TARGET_SPREAD, -SPLASH_TARGET_SPREAD},
+        {-SPLASH_TARGET_SPREAD, SPLASH_TARGET_SPREAD},
+        {-SPLASH_TARGET_SPREAD, -SPLASH_TARGET_SPREAD},
+    };
+    Trace_ptr trace = *(Trace_ptr *)(*trace_table + RELOFFSET_GI_TRACE);
+
+    if (!rocket_normal) {
+        return qfalse;
+    }
+    for (int i = 0; i < 5; i++) {
+        vec3_t point;
+        trace_t tr;
+
+        point[0] = (targ->r.absmin[0] + targ->r.absmax[0]) * 0.5f + sides[i][0];
+        point[1] = (targ->r.absmin[1] + targ->r.absmax[1]) * 0.5f + sides[i][1];
+        point[2] = (targ->r.absmin[2] + targ->r.absmax[2]) * 0.5f;
+        trace(&tr, point, zero, zero, origin, ENTITYNUM_NONE, SPLASH_CONTENTS_SOLID);
+
+        // A test point can sit in a wall next to the player.
+        if (tr.startsolid || tr.fraction >= 1.0f) {
+            continue;
+        }
+        float facing = tr.plane.normal[0] * rocket_normal[0] + tr.plane.normal[1] * rocket_normal[1] +
+                       tr.plane.normal[2] * rocket_normal[2];
+        if (facing < SPLASH_OPPOSED_FACES) {
+            return qtrue;
+        }
+    }
+    return qfalse;
 }
 
 static qboolean splash_bends_to(gentity_t *targ, const vec_t *origin) {
@@ -129,8 +193,13 @@ static qboolean __cdecl My_CanDamage(gentity_t *targ, const vec_t *origin) {
     }
 
     splash_stats.refused++;
+    if (splash_behind_slab(targ, origin)) {
+        splash_stats.opposed++;
+        return qfalse;
+    }
     if (splash_bends_to(targ, origin)) {
         splash_stats.bent++;
+        bent_target = targ;
         return qtrue;
     }
     return qfalse;
@@ -138,15 +207,49 @@ static qboolean __cdecl My_CanDamage(gentity_t *targ, const vec_t *origin) {
 
 static qboolean __cdecl My_G_RadiusDamage(const vec_t *origin, gentity_t *inflictor, gentity_t *ignore,
                                           const vec_t *normal, const vec_t *dir, int skip_sight) {
-    in_rocket = inflictor && inflictor->s.weapon == WP_ROCKET_LAUNCHER;
+    in_rocket     = inflictor && inflictor->s.weapon == WP_ROCKET_LAUNCHER;
+    rocket_normal = normal;
+    bent_target   = NULL;
     if (in_rocket) {
         splash_stats.explosions++;
     }
 
     qboolean hit = G_RadiusDamage(origin, inflictor, ignore, normal, dir, skip_sight);
 
-    in_rocket = 0;
+    in_rocket   = 0;
+    bent_target = NULL;
     return hit;
+}
+
+int SplashBend_ScaleDamage(gentity_t *targ, int damage) {
+    if (!targ || targ != bent_target || damage <= 0) {
+        return damage;
+    }
+    bent_target = NULL;
+
+    // G_Damage's knockback follows the damage it is given, so the kick is put right afterwards.
+    int scaled = (int)(damage * splash_fraction(qlx_splashBendDamage) + 0.5f);
+    if (scaled < 1) {
+        scaled = 1;
+    }
+    kick_target = targ;
+    kick_scale  = splash_fraction(qlx_splashBendKnockback) * damage / scaled;
+    for (int k = 0; k < 3; k++) {
+        kick_velocity[k] = targ->client->ps.velocity[k];
+    }
+    return scaled;
+}
+
+void SplashBend_ScaleKnockback(gentity_t *targ) {
+    if (!targ || targ != kick_target) {
+        return;
+    }
+    kick_target = NULL;
+
+    for (int k = 0; k < 3; k++) {
+        float kick                   = targ->client->ps.velocity[k] - kick_velocity[k];
+        targ->client->ps.velocity[k] = kick_velocity[k] + kick * kick_scale;
+    }
 }
 
 void SplashBend_Resolve(void) {
@@ -154,6 +257,9 @@ void SplashBend_Resolve(void) {
     G_RadiusDamage = NULL;
     trace_table    = NULL;
     in_rocket      = 0;
+    rocket_normal  = NULL;
+    bent_target    = NULL;
+    kick_target    = NULL;
     splash_cvars();
 
     pint can_damage = (pint)PatternSearch((void *)((pint)qagame + 0xB000), 0xB0000, PTRN_CANDAMAGE, MASK_CANDAMAGE);
@@ -214,9 +320,13 @@ void SplashBend_Command(void) {
         }
     }
 
-    ENGINE_PRINTF("qlx_splashBend %d, distance %d, %s\n", qlx_splashBend ? qlx_splashBend->integer : 0,
+    ENGINE_PRINTF("qlx_splashBend %d, distance %d, damage %.2f, knockback %.2f, %s\n",
+                  qlx_splashBend ? qlx_splashBend->integer : 0,
                   qlx_splashBendDistance ? qlx_splashBendDistance->integer : 0,
+                  qlx_splashBendDamage ? splash_fraction(qlx_splashBendDamage) : 0.0f,
+                  qlx_splashBendKnockback ? splash_fraction(qlx_splashBendKnockback) : 0.0f,
                   trace_table ? "hooks found" : "HOOKS NOT FOUND, stock splash");
-    ENGINE_PRINTF("rockets %u, players refused by stock %u, let through by the bend %u, rays %u\n",
-                  splash_stats.explosions, splash_stats.refused, splash_stats.bent, splash_stats.rays);
+    ENGINE_PRINTF("rockets %u, players refused by stock %u, behind a slab %u, let through by the bend %u, rays %u\n",
+                  splash_stats.explosions, splash_stats.refused, splash_stats.opposed, splash_stats.bent,
+                  splash_stats.rays);
 }
