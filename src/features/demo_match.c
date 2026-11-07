@@ -2159,6 +2159,7 @@ void DemoMatch_OnClientConnect(int slot) {
 
 void DemoMatch_Frame(void) {
     demo_cur_init();
+    demo_cvars_ensure();
     if (svs && svs->clients) {
         for (int slot = 0; slot < MAX_DEMO_CLIENTS; slot++) {
             const char* p = Demo_IsRecording(slot) ? Demo_GetPath(slot) : NULL;
