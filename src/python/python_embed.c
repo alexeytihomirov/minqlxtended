@@ -617,7 +617,10 @@ static PyObject* makePlayerTuple(int client_id) {
     PyObject *name, *team, *priv;
     PyObject* cid = PyLong_FromLongLong(client_id);
 
-    if (g_entities[client_id].client != NULL) {
+    // g_entities is NULL while the game module is down: during a map restart the engine
+    // runs ShutdownGame, and a bot's client command can reach a Python handler before the
+    // module is back. Fall through to the empty player rather than read through NULL.
+    if (g_entities != NULL && g_entities[client_id].client != NULL) {
         if (g_entities[client_id].client->pers.connected == CON_DISCONNECTED) {
             name = PyUnicode_FromString("");
         } else {
