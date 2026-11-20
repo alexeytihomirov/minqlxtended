@@ -112,6 +112,7 @@
 
 #include "common.h"
 #include "features/demo_match.h"
+#include "features/demo_multipov.h"
 #include "features/demo_name.h"
 #include "features/demos.h"
 #include "engine/quake_common.h"
@@ -119,7 +120,10 @@
 
 extern serverStatic_t* svs; // defined in dllmain.c
 
-#define MAX_DEMO_CLIENTS 64 // QL MAX_CLIENTS, same constant demos.c uses
+// QL MAX_CLIENTS client slots plus the multi-POV recording's virtual slot, same as demos.c. Only
+// the client slots have an svs->clients entry, and only below sv_maxclients: see
+// demo_slot_connected.
+#define MAX_DEMO_CLIENTS (MAX_CLIENTS + 1)
 
 #define DEMO_FINALIZE_QUEUE_SIZE 128u
 #define DEMO_COPY_CHUNK          (256u * 1024u)
@@ -232,6 +236,11 @@ static void demo_part_name(char* out, size_t n, const char* path) {
 // Ported from demo_slot.c, which existed only for the prebuffer and this.
 static void demo_build_pov_name(char* out, size_t n, const char* match_id, const char* map, int slot,
                                 const char* client_name) {
+    if (slot == DEMO_MULTIPOV_SLOT) {
+        // Every player's in one file: "{match_id}_{map}_multipov", seed and number appended.
+        snprintf(out, n, "%s_%s_multipov.dm_91", match_id, map);
+        return;
+    }
     char name[64];
     Demo_SanitiseName(name, sizeof(name), client_name);
     snprintf(out, n, "%s_%s_p%d_%s.dm_91", match_id, map, slot, name);
@@ -784,7 +793,8 @@ static int demo_write_index(const demo_pov_t* p, demo_scan_t* out_scan) {
     if (idx.scan.client_num >= 0) {
         client_num = idx.scan.client_num;
     }
-    if (idx.scan.client_num >= 0 && idx.scan.client_num != p->slot) {
+    // The multi-POV file's clientNum is its recorder slot (sv_maxclients), never DEMO_MULTIPOV_SLOT.
+    if (idx.scan.client_num >= 0 && idx.scan.client_num != p->slot && p->slot != DEMO_MULTIPOV_SLOT) {
         DebugPrint("demo: %s records client_num %d but was captured on slot %d\n", p->final_path,
                    idx.scan.client_num, p->slot);
     }
@@ -1669,8 +1679,17 @@ static int demo_cut_enabled(void) {
     return sv_demoCut && sv_demoCut->integer != 0;
 }
 
+// svs->clients holds sv_maxclients entries, so a slot at or past it is not read at all. The
+// multi-POV slot has no client: it counts as connected while its file is open.
 static int demo_slot_connected(int slot) {
-    return svs && svs->clients && svs->clients[slot].state >= CS_CONNECTED;
+    if (slot == DEMO_MULTIPOV_SLOT) {
+        return Demo_IsRecording(slot) ? 1 : 0;
+    }
+    if (!svs || !svs->clients || !sv_maxclients || slot < 0 || slot >= sv_maxclients->integer ||
+        slot >= MAX_CLIENTS) {
+        return 0;
+    }
+    return svs->clients[slot].state >= CS_CONNECTED;
 }
 
 // How long a mid-match joiner's POV reaches back before their join, in ms.
@@ -1704,6 +1723,9 @@ static int demo_join_lead_ms(void) {
 // wrong "spectator" would DELETE a real player's capture, while a wrong "playing"
 // only ships a POV nobody wanted.
 static int demo_slot_playing(int slot) {
+    if (slot == DEMO_MULTIPOV_SLOT) {
+        return 1; // every player's view, never a spectator capture to throw away
+    }
     if (!level || !level->clients) {
         return 1;
     }
@@ -1729,9 +1751,14 @@ static int demo_slot_playing(int slot) {
 // real captures of one match: the countdown message is seq 1009 in p0, 669 in
 // p1, 3481 in p2, 8032 in p3-p7, all at server time 201725), so there is no
 // server-wide sequence to recover it from later.
+//
+// The multi-POV recording numbers its blocks itself; its next block is the same instant.
 static int32_t demo_slot_seq(int slot) {
     if (!demo_slot_connected(slot)) {
         return -1;
+    }
+    if (slot == DEMO_MULTIPOV_SLOT) {
+        return MultiPov_NextSeq();
     }
     return (int32_t)svs->clients[slot].netchan.outgoingSequence;
 }
@@ -1779,11 +1806,12 @@ static void demo_seg_arm(demo_seg_t* s) {
         return;
     }
     snprintf(s->match_id, sizeof(s->match_id), "%s", g_match_id);
-    s->arm_seq  = demo_slot_seq(s->slot);
-    s->steam_id = demo_slot_connected(s->slot) ? svs->clients[s->slot].steam_id : 0;
+    const int client = s->slot != DEMO_MULTIPOV_SLOT && demo_slot_connected(s->slot);
+    s->arm_seq       = demo_slot_seq(s->slot);
+    s->steam_id      = client ? svs->clients[s->slot].steam_id : 0;
     snprintf(s->match_guid, sizeof(s->match_guid), "%s", g_match_guid);
 
-    const char* name = demo_slot_connected(s->slot) ? svs->clients[s->slot].name : "";
+    const char* name = client ? svs->clients[s->slot].name : (s->slot == DEMO_MULTIPOV_SLOT ? "multipov" : "");
     demo_seg_build_final(s, name);
     if (!s->final_path[0]) {
         DebugPrint("demo: slot %d has no fs_homepath; segment %s will not be published\n", s->slot, s->path);
@@ -2230,7 +2258,7 @@ void DemoMatch_OnFinished(const demo_finished_t* done) {
     // whole capture, every match in it included. Checked ahead of spectated:
     // a served capture has saw_live set too, and the two want opposite logs.
     int served        = !s->armed && s->served_match;
-    int spectated     = !s->armed && !s->served_match && s->saw_live;
+    int spectated     = !s->armed && !s->served_match && s->saw_live && done->slot != DEMO_MULTIPOV_SLOT;
     int join_lead_ms  = s->joined_late ? demo_join_lead_ms() : 0;
     char match_id[64];
     snprintf(match_id, sizeof(match_id), "%s", s->match_id);
