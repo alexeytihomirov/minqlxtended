@@ -37,8 +37,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <unistd.h>
 
 #include "common.h"
+#include "demos.h"
 #include "stream.h"
 #include "engine/quake_common.h"
+
+_Static_assert(STREAM_MULTIPOV_SLOT == DEMO_MULTIPOV_SLOT, "the disk and the stream use one multi-POV slot");
+_Static_assert(STREAM_MULTIPOV_SLOT == MAX_STREAM_CLIENTS - 1, "the multi-POV slot is the last stream slot");
 
 extern serverStatic_t *svs; // defined in dllmain.c
 extern server_t *sv;        // defined in dllmain.c; NULL if its pattern did not resolve
@@ -1185,12 +1189,20 @@ static int block_is_full_snapshot(const client_t *client) {
     return (client->state != CS_ACTIVE) || (client->deltaMessage <= 0);
 }
 
-// An explicit per-slot request wins over the sv_demoStreamSlots mask.
+// An explicit per-slot request wins over the sv_demoStreamSlots mask. While multi-POV is on the
+// virtual slot streams and no client slot does of its own accord; the mask has no bit for the
+// virtual slot.
 static int stream_slot_wanted(int slot) {
     if (stream_request[slot] > 0) {
         return 1;
     }
     if (stream_request[slot] < 0) {
+        return 0;
+    }
+    if (slot == STREAM_MULTIPOV_SLOT) {
+        return Demo_MultiPovOn();
+    }
+    if (Demo_MultiPovOn()) {
         return 0;
     }
     return (int)((stream_slot_mask >> slot) & 1ull);
@@ -1275,17 +1287,23 @@ int Stream_Interested(int slot) {
     return stream_enabled();
 }
 
-int Stream_Want(int slot, int is_gamestate, client_t *client) {
-    if (slot < 0 || slot >= MAX_STREAM_CLIENTS) {
-        return 0;
-    }
-
+// Closes the slot's POV when it is no longer wanted. Returns whether it is wanted.
+static int stream_check_wanted(int slot) {
     if (!stream_enabled() || !stream_slot_wanted(slot)) {
         if (stream_active[slot]) {
             stream_rec_hdr_t hdr = {STREAM_REC_CLOSE, slot, SCR_DISABLED, stream_gen[slot], 0, 0};
             stream_put(&hdr, NULL);
             stream_active[slot] = 0;
         }
+        return 0;
+    }
+    return 1;
+}
+
+// Stream_Want without the client: open carries what the OPEN record needs at a gamestate, seq is
+// the block's own sequence number.
+static int stream_want_slot(int slot, int is_gamestate, int seq, const stream_open_t *open) {
+    if (!stream_check_wanted(slot)) {
         return 0;
     }
     if (!stream_reconcile_thread()) {
@@ -1299,16 +1317,9 @@ int Stream_Want(int slot, int is_gamestate, client_t *client) {
             stream_active[slot] = 0;
         }
 
-        stream_open_t open;
-        memset(&open, 0, sizeof(open));
-        open.steam_id      = client->steam_id;
-        open.gamestate_seq = (uint32_t)client->netchan.outgoingSequence;
-        open.command_seq   = (uint32_t)client->reliableSequence;
-        snprintf(open.name, sizeof(open.name), "%s", client->name);
-
         stream_rec_hdr_t hdr = {
-            STREAM_REC_OPEN, slot, 0, stream_gen[slot] + 1, 0, (uint32_t)sizeof(open)};
-        if (stream_put(&hdr, &open) != 0) {
+            STREAM_REC_OPEN, slot, 0, stream_gen[slot] + 1, 0, (uint32_t)sizeof(*open)};
+        if (stream_put(&hdr, open) != 0) {
             return 0; // ring full at an open; retry at this client's next gamestate
         }
         stream_gen[slot]            = hdr.gen;
@@ -1316,7 +1327,7 @@ int Stream_Want(int slot, int is_gamestate, client_t *client) {
         stream_gap_count[slot]      = 0;
         stream_resync_pending[slot] = 0;
         stream_last_full_ms[slot]   = stream_now_ms();
-        snprintf(stream_name[slot], sizeof(stream_name[slot]), "%s", client->name);
+        snprintf(stream_name[slot], sizeof(stream_name[slot]), "%s", open->name);
         // Queued whether the link is up or not: the thread caches and replays it, and a relay that
         // reconnects mid-map cannot decode this POV without it.
         return 1;
@@ -1328,14 +1339,14 @@ int Stream_Want(int slot, int is_gamestate, client_t *client) {
 
     // Link down: drop at the source. The loss is counted here and declared once the link is back.
     if (!atomic_load_explicit(&stream_link_up, memory_order_relaxed)) {
-        stream_note_drop(slot, client->netchan.outgoingSequence, SGR_LINK_DOWN);
+        stream_note_drop(slot, seq, SGR_LINK_DOWN);
         return 0;
     }
 
     // Too far behind. Dropping here saves the copy, and the gap tells the relay to start again
     // from the full snapshot this arranges. Gamestates return above.
     if (stream_over_lag()) {
-        stream_note_drop(slot, client->netchan.outgoingSequence, SGR_LAGGING);
+        stream_note_drop(slot, seq, SGR_LAGGING);
         return 0;
     }
 
@@ -1343,17 +1354,24 @@ int Stream_Want(int slot, int is_gamestate, client_t *client) {
     return 1;
 }
 
-void Stream_Block(int slot, int seq, int is_gamestate, client_t *client, const unsigned char *data,
-                  uint32_t len) {
-    if (slot < 0 || slot >= MAX_STREAM_CLIENTS) {
-        return;
+int Stream_Want(int slot, int is_gamestate, client_t *client) {
+    if (slot < 0 || slot >= MAX_CLIENTS) { // never the multi-POV slot: that one has no client
+        return 0;
     }
 
-    uint32_t flags = 0;
+    stream_open_t open;
+    memset(&open, 0, sizeof(open));
     if (is_gamestate) {
-        flags |= SBF_GAMESTATE;
-    } else if (block_is_full_snapshot(client)) {
-        flags |= SBF_FULL;
+        open.steam_id      = client->steam_id;
+        open.gamestate_seq = (uint32_t)client->netchan.outgoingSequence;
+        open.command_seq   = (uint32_t)client->reliableSequence;
+        snprintf(open.name, sizeof(open.name), "%s", client->name);
+    }
+    return stream_want_slot(slot, is_gamestate, client->netchan.outgoingSequence, &open);
+}
+
+static void stream_block_slot(int slot, int seq, uint32_t flags, const unsigned char *data, uint32_t len) {
+    if (flags & SBF_FULL) {
         stream_resync_pending[slot] = 0; // the resync this slot was waiting for has gone out
     }
 
@@ -1363,6 +1381,65 @@ void Stream_Block(int slot, int seq, int is_gamestate, client_t *client, const u
     } else if (flags & (SBF_FULL | SBF_GAMESTATE)) {
         stream_last_full_ms[slot] = stream_now_ms();
     }
+}
+
+void Stream_Block(int slot, int seq, int is_gamestate, client_t *client, const unsigned char *data,
+                  uint32_t len) {
+    if (slot < 0 || slot >= MAX_CLIENTS) {
+        return;
+    }
+
+    uint32_t flags = 0;
+    if (is_gamestate) {
+        flags |= SBF_GAMESTATE;
+    } else if (block_is_full_snapshot(client)) {
+        flags |= SBF_FULL;
+    }
+    stream_block_slot(slot, seq, flags, data, len);
+}
+
+static uint64_t stream_keyframe_ms(void);
+
+int Stream_MultiPovWanted(void) {
+    return stream_check_wanted(STREAM_MULTIPOV_SLOT);
+}
+
+int Stream_MultiPovWant(int is_gamestate, int seq, int command_seq) {
+    stream_open_t open;
+    memset(&open, 0, sizeof(open));
+    open.steam_id      = 0; // nobody's: the recorder is not a player
+    open.gamestate_seq = (uint32_t)seq;
+    open.command_seq   = (uint32_t)command_seq;
+    snprintf(open.name, sizeof(open.name), "%s", "multipov");
+    return stream_want_slot(STREAM_MULTIPOV_SLOT, is_gamestate, seq, &open);
+}
+
+// The builder's own keyframes, in place of stream_arm_keyframes + stream_force_resyncs, which
+// arrange a client's through client_t::deltaMessage. Same conditions as theirs.
+int Stream_MultiPovWantsFull(void) {
+    const int slot = STREAM_MULTIPOV_SLOT;
+    if (!stream_active[slot]) {
+        return 0;
+    }
+    if (stream_resync_pending[slot]) {
+        return 1;
+    }
+    if (sv_demoStreamResync && !sv_demoStreamResync->integer) {
+        return 0;
+    }
+    uint64_t interval = stream_keyframe_ms();
+    if (interval == 0 || stream_shedding || !atomic_load_explicit(&stream_link_up, memory_order_relaxed)) {
+        return 0;
+    }
+    return stream_now_ms() - stream_last_full_ms[slot] >= interval;
+}
+
+void Stream_MultiPovBlock(int seq, int is_gamestate, int is_full, const unsigned char *data, uint32_t len) {
+    if (!stream_active[STREAM_MULTIPOV_SLOT] || len == 0 || len > STREAM_BODY_MAX) {
+        return;
+    }
+    uint32_t flags = is_gamestate ? SBF_GAMESTATE : (is_full ? SBF_FULL : 0);
+    stream_block_slot(STREAM_MULTIPOV_SLOT, seq, flags, data, len);
 }
 
 void Stream_ClientDisconnect(int slot) {
@@ -1472,7 +1549,7 @@ static void stream_parse_slots(void) {
         if (end == p) {
             break;
         }
-        if (n >= 0 && n < MAX_STREAM_CLIENTS) {
+        if (n >= 0 && n < MAX_CLIENTS) { // client slots only: the mask is 64 bits wide
             mask |= 1ull << n;
         }
         p = end;
@@ -1682,8 +1759,8 @@ static void stream_arm_keyframes(void) {
         return; // a full snapshot is the largest message; do not add one while behind
     }
     int limit = sv_maxclients->integer;
-    if (limit > MAX_STREAM_CLIENTS) {
-        limit = MAX_STREAM_CLIENTS;
+    if (limit > MAX_CLIENTS) { // client slots only; the multi-POV slot keys its own frames
+        limit = MAX_CLIENTS;
     }
     if (limit <= 0) {
         return;
@@ -1710,8 +1787,8 @@ static void stream_force_resyncs(void) {
 
     int budget = cvar_clamped(sv_demoStreamResyncPerFrame, 1, 1, MAX_STREAM_CLIENTS);
     int limit  = sv_maxclients->integer;
-    if (limit > MAX_STREAM_CLIENTS) {
-        limit = MAX_STREAM_CLIENTS;
+    if (limit > MAX_CLIENTS) { // svs->clients[] has no entry for the multi-POV slot
+        limit = MAX_CLIENTS;
     }
     if (limit <= 0) {
         return;
@@ -1815,21 +1892,31 @@ void Stream_Status(stream_status_t *out) {
     snprintf(out->error, sizeof(out->error), "%s", stream_error);
     pthread_mutex_unlock(&stream_lock);
 
-    int limit = (sv_maxclients && sv_maxclients->integer > 0 &&
-                 sv_maxclients->integer < MAX_STREAM_CLIENTS)
+    int limit = (sv_maxclients && sv_maxclients->integer > 0 && sv_maxclients->integer < MAX_CLIENTS)
                     ? sv_maxclients->integer
-                    : MAX_STREAM_CLIENTS;
-    out->slot_count = limit;
+                    : MAX_CLIENTS;
+    // The multi-POV slot follows the client slots, while it is open or still owes a resync.
+    int slots[MAX_STREAM_CLIENTS];
+    int count = 0;
     for (int i = 0; i < limit; i++) {
-        out->slots[i].slot      = i;
-        out->slots[i].active    = stream_active[i];
-        out->slots[i].desynced  = atomic_load_explicit(&stream_desynced[i], memory_order_relaxed);
-        out->slots[i].resyncing = stream_resync_pending[i];
-        out->slots[i].requested = stream_request[i];
-        out->slots[i].gen       = stream_gen[i];
+        slots[count++] = i;
+    }
+    if (stream_active[STREAM_MULTIPOV_SLOT] ||
+        atomic_load_explicit(&stream_desynced[STREAM_MULTIPOV_SLOT], memory_order_relaxed)) {
+        slots[count++] = STREAM_MULTIPOV_SLOT;
+    }
+    out->slot_count = count;
+    for (int k = 0; k < count; k++) {
+        int i                   = slots[k];
+        out->slots[k].slot      = i;
+        out->slots[k].active    = stream_active[i];
+        out->slots[k].desynced  = atomic_load_explicit(&stream_desynced[i], memory_order_relaxed);
+        out->slots[k].resyncing = stream_resync_pending[i];
+        out->slots[k].requested = stream_request[i];
+        out->slots[k].gen       = stream_gen[i];
         // Whole-row copy: both are char[40] and the source row is always terminated.
-        memcpy(out->slots[i].name, stream_name[i], sizeof(out->slots[i].name));
-        out->slots[i].name[sizeof(out->slots[i].name) - 1] = '\0';
+        memcpy(out->slots[k].name, stream_name[i], sizeof(out->slots[k].name));
+        out->slots[k].name[sizeof(out->slots[k].name) - 1] = '\0';
     }
 }
 

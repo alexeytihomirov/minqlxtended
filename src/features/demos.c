@@ -42,7 +42,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 extern serverStatic_t *svs; // defined in dllmain.c
 
 #define SVC_EOF 8
-#define MAX_DEMO_CLIENTS 64                // QL MAX_CLIENTS
+// QL MAX_CLIENTS client slots, plus the multi-POV recording's virtual slot (DEMO_MULTIPOV_SLOT).
+#define MAX_DEMO_CLIENTS (MAX_CLIENTS + 1)
+_Static_assert(DEMO_MULTIPOV_SLOT == MAX_DEMO_CLIENTS - 1, "the multi-POV slot is the last demo slot");
 #define DEMO_RING_SIZE (16u * 1024 * 1024) // power of two
 
 typedef enum {
@@ -124,6 +126,7 @@ static cvar_t *sv_demoRecord;       // 0 = off, 1 = record every connected clien
 static cvar_t *sv_demoDir;          // output subdirectory, under fs_homepath
 static cvar_t *sv_demoNameFormat;   // filename template: %date %slot %name
 static cvar_t *sv_demoCleanupParts; // remove leftover .part files at startup
+static cvar_t *sv_demoMultiPov;     // 1 = one multi-POV recording instead of one per client
 static cvar_t *fs_homepath;
 
 static const int32_t demo_eof[2] = {-1, -1};
@@ -141,7 +144,7 @@ static void demo_mkdir_p(const char *path) {
     mkdir(tmp, 0755);
 }
 
-static void demo_build_name(char *out, size_t n, int slot, client_t *client) {
+static void demo_build_name(char *out, size_t n, int slot, const char *client_name) {
     const char *subdir = (sv_demoDir && sv_demoDir->string[0]) ? sv_demoDir->string : "demos";
 
     time_t now = time(NULL);
@@ -152,7 +155,7 @@ static void demo_build_name(char *out, size_t n, int slot, client_t *client) {
     }
 
     char name[64];
-    Demo_SanitiseName(name, sizeof(name), client->name);
+    Demo_SanitiseName(name, sizeof(name), client_name);
 
     const char *fmt = (sv_demoNameFormat && sv_demoNameFormat->string[0]) ? sv_demoNameFormat->string
                                                                           : "%date_slot%slot_%name";
@@ -546,7 +549,9 @@ static void *demo_writer_main(void *unused) {
     }
 }
 
-// An explicit per-slot request wins over the global cvar.
+// An explicit per-slot request wins over the global cvar. sv_demoRecord means "the multi-POV
+// file" for the virtual slot and nothing for a client slot while multi-POV is on, and "every
+// client" otherwise.
 static int demo_slot_wanted(int slot) {
     if (demo_request[slot] > 0) {
         return 1;
@@ -554,11 +559,15 @@ static int demo_slot_wanted(int slot) {
     if (demo_request[slot] < 0) {
         return 0;
     }
-    return sv_demoRecord->integer != 0;
+    if (slot == DEMO_MULTIPOV_SLOT) {
+        return sv_demoRecord->integer != 0 && Demo_MultiPovOn();
+    }
+    return sv_demoRecord->integer != 0 && !Demo_MultiPovOn();
 }
 
 static int demo_reconcile_thread(void) {
-    // Needed if we're recording everyone, or any one slot was explicitly asked for.
+    // Needed if we're recording everyone, or any one slot was explicitly asked for. The
+    // multi-POV recording is behind sv_demoRecord too, so it counts as enabled through it.
     int enabled = sv_demoRecord->integer != 0 || demo_forced_on > 0;
 
     if (enabled && demo_state_cached == DEMO_THREAD_RUNNING) {
@@ -706,6 +715,8 @@ void Demo_Init(void) {
     sv_demoDir          = Cvar_Get("sv_demoDir", "demos", CVAR_ARCHIVE);
     sv_demoNameFormat   = Cvar_Get("sv_demoNameFormat", "%date_slot%slot_%name", CVAR_ARCHIVE);
     sv_demoCleanupParts = Cvar_Get("sv_demoCleanupParts", "1", CVAR_ARCHIVE);
+    // One multi-POV recording per server instead of one per client; see demo_multipov.c.
+    sv_demoMultiPov     = Cvar_Get("sv_demoMultiPov", "0", CVAR_ARCHIVE);
     fs_homepath         = Cvar_FindVar("fs_homepath");
 
     // Once per process: by the second G_InitGame the .part files on disk are our own. So
@@ -724,7 +735,7 @@ static int demo_interested(int slot) {
     return sv_demoRecord && sv_demoRecord->integer;
 }
 
-static int demo_want(int slot, int is_gamestate, client_t *client) {
+static int demo_want(int slot, int is_gamestate, const char *name) {
     if (!sv_demoRecord || !fs_homepath) {
         return 0;
     }
@@ -753,7 +764,7 @@ static int demo_want(int slot, int is_gamestate, client_t *client) {
             demo_active[slot] = 0;
         }
         char path[512];
-        demo_build_name(path, sizeof(path), slot, client);
+        demo_build_name(path, sizeof(path), slot, name);
         hdr.type = DEMO_REC_OPEN;
         hdr.len  = (uint32_t)strlen(path) + 1;
         hdr.seq  = (int32_t)(demo_gen[slot] + 1); // seq is unused for OPEN.
@@ -770,6 +781,63 @@ static int demo_want(int slot, int is_gamestate, client_t *client) {
     return 1;
 }
 
+// Queues one block for the slot's open segment. A full ring loses the segment: it is closed
+// rather than left with a hole in its delta chain.
+static void demo_put_block(int slot, int seq, const unsigned char *data, uint32_t len) {
+    demo_rec_hdr_t hdr = {DEMO_REC_BLOCK, (int32_t)slot, (int32_t)seq, len};
+    if (demo_ring_put(&hdr, data) != 0) {
+        DebugPrint("demo: ring full, dropping slot %d segment\n", slot);
+        demo_active[slot] = 0;
+        hdr.type          = DEMO_REC_CLOSE;
+        hdr.len           = 0;
+        demo_ring_put(&hdr, NULL);
+    }
+}
+
+int Demo_MultiPovOn(void) {
+    if (!sv_demoMultiPov || !sv_demoMultiPov->integer || !sv_maxclients) {
+        return 0;
+    }
+    // The recorder takes slot sv_maxclients, the first one no client can have. A full 64-slot
+    // server has none, so it records per client as without the cvar.
+    if (sv_maxclients->integer <= 0 || sv_maxclients->integer >= MAX_CLIENTS) {
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            DebugPrint("demo: sv_demoMultiPov needs sv_maxclients below %d (it is %d); recording per client\n",
+                       MAX_CLIENTS, sv_maxclients->integer);
+        }
+        return 0;
+    }
+    return 1;
+}
+
+int Demo_MultiPovWanted(void) {
+    if (!sv_demoRecord || !fs_homepath) {
+        return 0;
+    }
+    if (!demo_slot_wanted(DEMO_MULTIPOV_SLOT) || !Demo_MultiPovOn()) {
+        if (demo_active[DEMO_MULTIPOV_SLOT]) {
+            demo_rec_hdr_t hdr = {DEMO_REC_CLOSE, DEMO_MULTIPOV_SLOT, 0, 0};
+            demo_ring_put(&hdr, NULL);
+            demo_active[DEMO_MULTIPOV_SLOT] = 0;
+        }
+        return 0;
+    }
+    return 1;
+}
+
+int Demo_MultiPovWant(int is_gamestate) {
+    return demo_want(DEMO_MULTIPOV_SLOT, is_gamestate, "multipov");
+}
+
+void Demo_MultiPovBlock(int seq, const unsigned char *data, uint32_t len) {
+    if (!demo_active[DEMO_MULTIPOV_SLOT] || len == 0 || len > sizeof(writer_scratch)) {
+        return;
+    }
+    demo_put_block(DEMO_MULTIPOV_SLOT, seq, data, len);
+}
+
 static void Demo_CaptureBody(msg_t *msg, client_t *client) {
     if (!MSG_WriteBits || !svs || !svs->clients) {
         return;
@@ -779,7 +847,7 @@ static void Demo_CaptureBody(msg_t *msg, client_t *client) {
     }
 
     long slot = client - svs->clients;
-    if (slot < 0 || slot >= MAX_DEMO_CLIENTS) {
+    if (slot < 0 || slot >= MAX_CLIENTS) { // never the multi-POV slot: that one has no client
         return;
     }
 
@@ -792,7 +860,7 @@ static void Demo_CaptureBody(msg_t *msg, client_t *client) {
     int seq          = client->netchan.outgoingSequence;
     int is_gamestate = (seq == client->gamestateMessageNum);
 
-    int to_disk   = disk_maybe && demo_want((int)slot, is_gamestate, client);
+    int to_disk   = disk_maybe && demo_want((int)slot, is_gamestate, client->name);
     int to_stream = stream_maybe && Stream_Want((int)slot, is_gamestate, client);
     if (!to_disk && !to_stream) {
         return;
@@ -806,14 +874,7 @@ static void Demo_CaptureBody(msg_t *msg, client_t *client) {
     MSG_WriteBits(&tmp, SVC_EOF, 8); // bit-accurate append.
 
     if (to_disk) {
-        demo_rec_hdr_t hdr = {DEMO_REC_BLOCK, (int32_t)slot, (int32_t)seq, (uint32_t)tmp.cursize};
-        if (demo_ring_put(&hdr, capture_scratch) != 0) {
-            DebugPrint("demo: ring full, dropping slot %ld segment\n", slot);
-            demo_active[slot] = 0;
-            hdr.type          = DEMO_REC_CLOSE;
-            hdr.len           = 0;
-            demo_ring_put(&hdr, NULL);
-        }
+        demo_put_block((int)slot, seq, capture_scratch, (uint32_t)tmp.cursize);
     }
 
     if (to_stream) {

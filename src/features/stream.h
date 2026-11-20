@@ -35,7 +35,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  * every later snapshot deltas against a frame the relay never saw.
  */
 
-#define MAX_STREAM_CLIENTS MAX_CLIENTS
+// Every client slot, plus the multi-POV recording's virtual slot after them (demo_multipov.c).
+#define STREAM_MULTIPOV_SLOT MAX_CLIENTS
+#define MAX_STREAM_CLIENTS   (MAX_CLIENTS + 1)
 
 // Per-slot view for "qlx_stream" and stream_status(). Game thread only, as are its source arrays.
 typedef struct {
@@ -94,6 +96,19 @@ int Stream_Want(int slot, int is_gamestate, client_t *client);
 // Queue one block. Never fails the caller: a full ring is reported to the relay as a gap.
 void Stream_Block(int slot, int seq, int is_gamestate, client_t *client, const unsigned char *data,
                   uint32_t len);
+
+// The multi-POV slot, for demo_multipov.c. It has no client_t: the builder makes its own blocks
+// and decides itself which are full snapshots. Game thread only.
+//   Stream_MultiPovWanted: whether the slot should stream now (multi-POV on, the stream enabled);
+//     closes an open POV that is no longer wanted.
+//   Stream_MultiPovWant: Stream_Want for the slot. seq is the block's sequence; command_seq the
+//     recording's server command sequence at a gamestate.
+//   Stream_MultiPovWantsFull: a resync or a keyframe is due, so the next block should be full.
+//   Stream_MultiPovBlock: Stream_Block for the slot; is_full marks a non-delta snapshot.
+int Stream_MultiPovWanted(void);
+int Stream_MultiPovWant(int is_gamestate, int seq, int command_seq);
+int Stream_MultiPovWantsFull(void);
+void Stream_MultiPovBlock(int seq, int is_gamestate, int is_full, const unsigned char *data, uint32_t len);
 
 // Once per game frame, before the engine's own frame. Publishes map changes and configstrings,
 // and sets up the forced full snapshots a resync needs.

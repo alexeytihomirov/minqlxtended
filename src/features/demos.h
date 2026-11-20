@@ -41,6 +41,11 @@ typedef struct {
     char path[520];
 } demo_finished_t;
 
+// The multi-POV recording (sv_demoMultiPov, demo_multipov.c) is not a client: it has its own
+// virtual slot after the last client slot. Every per-slot Demo_* call below accepts it, and
+// demo_finished_t.slot carries it for its segments.
+#define DEMO_MULTIPOV_SLOT MAX_CLIENTS
+
 void Demo_Init(void);                            // register + cache cvars
 void Demo_Capture(msg_t *msg, client_t *client); // called for every S2C message
 void Demo_ClientDisconnect(int slot);            // finalise a client's demo
@@ -72,5 +77,20 @@ qboolean Demo_Snapshot(int slot, const char *dest_path);
 unsigned Demo_PendingFinished(void);
 qboolean Demo_PollFinished(demo_finished_t *out);
 unsigned Demo_TakeDroppedCount(void); // dropped-on-overflow count, then clears it
+
+// sv_demoMultiPov is set and there is a free slot for the recorder (sv_maxclients < 64). While
+// it is, sv_demoRecord records the one multi-POV file and no client of its own accord. Logs
+// once when the cvar is set but sv_maxclients leaves no slot. Game thread only.
+int Demo_MultiPovOn(void);
+
+// The disk side of the multi-POV recording, for demo_multipov.c. Game thread only.
+//   Demo_MultiPovWanted: whether the virtual slot should be recording now (multi-POV on,
+//     sv_demoRecord or an explicit Demo_Request); closes an open file that is no longer wanted.
+//   Demo_MultiPovWant: demo_want for the virtual slot. With is_gamestate it opens a new file
+//     (closing the previous one); otherwise it says whether the open file takes the block.
+//   Demo_MultiPovBlock: queues one block (body ending in svc_EOF); a full ring closes the file.
+int Demo_MultiPovWanted(void);
+int Demo_MultiPovWant(int is_gamestate);
+void Demo_MultiPovBlock(int seq, const unsigned char *data, uint32_t len);
 
 #endif /* DEMOS_H */
