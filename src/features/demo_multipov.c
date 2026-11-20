@@ -741,6 +741,12 @@ void MultiPov_ServerCommand(int slot, const char *text) {
     mp_cmd_head++;
 }
 
+#ifndef NOPY
+#define MP_SCORES_EVERY_MS 2000
+static int mp_scores_for  = -1; // the followed player the last scoreboard was asked for
+static int mp_scores_time = 0;  // svs->time of that ask
+#endif
+
 void MultiPov_Frame(void) {
     if (!svs || !svs->clients || !sv || !g_entities || !level || !level->clients || !sv_maxclients) {
         return;
@@ -782,6 +788,19 @@ void MultiPov_Frame(void) {
     const int recorder = sv_maxclients->integer;
     mp_update_followed();
     mp_update_cmd_source();
+
+#ifndef NOPY
+    // QL's duel bar and scoreboard come from the scores command, which a client gets only when it
+    // asks for it; the recorder never asks, so without this the recording showed no names until
+    // the match start (operator, 2026-11-20). Ask the game for the followed player's scoreboard
+    // now and then, as a client holding Tab does: it goes to him and the command tap records it.
+    if (mp_followed >= 0 && SelectScoreboardMessage &&
+        (mp_scores_for != mp_followed || svs->time - mp_scores_time >= MP_SCORES_EVERY_MS || svs->time < mp_scores_time)) {
+        mp_scores_for  = mp_followed;
+        mp_scores_time = svs->time;
+        My_SelectScoreboardMessage(&g_entities[mp_followed]);
+    }
+#endif
     mp_update_areabytes();
     if (!mp_areabytes) {
         mp_areabytes = 1; // no client has had a snapshot yet; replaced by the real count when one has
