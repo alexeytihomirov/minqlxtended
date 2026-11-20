@@ -24,6 +24,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <string.h>
 
 #include "common.h"
+#include "demo_multipov.h"
 #include "reliable.h"
 
 /* See reliable.h for what this guards against and why. */
@@ -183,6 +184,7 @@ static void send_now(int slot, const char* cmd) {
     }
     // The real SV_SendServerCommand, going around our own hook. The server_command event
     // already fired for this text when it was first submitted.
+    MultiPov_ServerCommand(slot, cmd);
     SV_SendServerCommand(cl, "%s", cmd);
     rel_sent_this_frame++;
 }

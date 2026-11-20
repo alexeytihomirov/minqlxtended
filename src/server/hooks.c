@@ -32,6 +32,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "common.h"
 #include "features/console_command.h"
 #include "features/demo_match.h"
+#include "features/demo_multipov.h"
 #include "features/demos.h"
 #include "hook/patches.h"
 #include "maps_parser.h"
@@ -349,6 +350,8 @@ void __cdecl My_SV_SendServerCommand(client_t* cl, char* fmt, ...) {
         return;
     }
 
+    // The paced path records its commands when reliable.c sends them.
+    MultiPov_ServerCommand(cl ? (int)(cl - svs->clients) : -1, res);
     SV_SendServerCommand(cl, "%s", res);
 }
 
@@ -721,6 +724,16 @@ void __cdecl My_G_RunFrame(int time) {
         GameEvents_Frame();
     }
 #endif
+
+    // After the game event poll too, so a match armed on this frame starts at this frame's
+    // multi-POV block (MultiPov_NextSeq is its arm_seq), as a client's POV starts at the
+    // snapshot the engine sends after this frame.
+    if (!sv_spawning) {
+        MultiPov_Frame();
+#ifdef NOPY
+        DrainFinishedDemos(); // a nopy build has no other drain while no client gets a message
+#endif
+    }
 
     // The engine's own frame is in here too, so this is what we measure the other probes
     // against. It isn't an overhead figure of its own.
