@@ -717,7 +717,12 @@ static int dc_parse_snapshot(dc_parser_t *p, dc_msg_t *msg) {
         dc_msg_write_byte(&p->outMsg, stored->snapFlags);
         dc_msg_write_byte(&p->outMsg, stored->areamaskLen);
         dc_msg_write_data(&p->outMsg, stored->areamask, stored->areamaskLen);
-        dc_msg_write_delta_playerstate(&p->outMsg, oldSnap ? &oldSnap->ps : NULL, &stored->ps);
+        // A full snapshot (no old one) writes clientNum even when it is 0: a reader that seeds a
+        // blank playerState with the gamestate's clientNum (the site player's parser) would otherwise
+        // take a multi-POV recording's follow of player 0 for the recorder slot. The engine reads the
+        // same value either way; for a per-client POV the value equals the gamestate's anyway.
+        static const dc_playerState_t keyframe_base = {.clientNum = -1};
+        dc_msg_write_delta_playerstate(&p->outMsg, oldSnap ? &oldSnap->ps : &keyframe_base, &stored->ps);
         dc_emit_packet_entities(p, deltaNum ? oldSnap : NULL, stored);
         p->outSnapshotsWritten++;
         p->outSnapshotCount++;
