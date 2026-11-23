@@ -1,4 +1,5 @@
-// splash_bend.h - rocket splash that bends around a nearby corner. See splash_bend.c.
+// splash_bend.h - rocket splash that reaches round a step or a little way round a corner. See
+// splash_bend.c; the rules are in splash_math.c.
 
 #ifndef SPLASH_BEND_H
 #define SPLASH_BEND_H
