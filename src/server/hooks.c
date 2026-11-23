@@ -41,6 +41,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "features/rcon_send.h"
 #include "features/reliable.h"
 #include "features/scoreboard.h"
+#include "features/splash_bend.h"
 #include "features/stream.h"
 #include "hook/simple_hook.h"
 
@@ -637,7 +638,9 @@ void __cdecl My_FireWeapon(gentity_t* ent) {
 // victim's health is what they were left with.
 void __cdecl My_G_Damage(gentity_t* targ, gentity_t* inflictor, gentity_t* attacker,
                          vec3_t dir, vec3_t point, int damage, int dflags, int mod) {
+    int dealt = SplashBend_ScaleDamage(targ, mod, &damage);
     G_Damage(targ, inflictor, attacker, dir, point, damage, dflags, mod);
+    SplashBend_EndDamage();
 
     // Doors and other shootable brushes take damage constantly and aren't what anyone
     // hooks this for, so players only.
@@ -649,7 +652,7 @@ void __cdecl My_G_Damage(gentity_t* targ, gentity_t* inflictor, gentity_t* attac
     // entity. A player damaging themselves reports themselves.
     int attacker_id = (attacker && attacker->client) ? (int)(attacker - g_entities) : -1;
 
-    DamageDispatcher((int)(targ - g_entities), attacker_id, damage, dflags, mod);
+    DamageDispatcher((int)(targ - g_entities), attacker_id, dealt, dflags, mod);
 }
 
 void __cdecl My_G_StartKamikaze(gentity_t* ent) {
@@ -955,6 +958,8 @@ void HookVm(void) {
             count++;
         }
     }
+
+    count += SplashBend_Hook(); // tolerated as well; counts what it installed
 
     if (failed) {
         DebugPrint("Exiting.\n");
